@@ -47,7 +47,7 @@ use_repo(llvm, "llvm_toolchain")
 # rules_java tracks what Bazel 9's own bazel_tools already forces into the
 # resolved graph — a lower pin here only buys the check_direct_dependencies
 # warning on every invocation.
-bazel_dep(name = "rules_java", version = "9.7.0")
+bazel_dep(name = "rules_java", version = "9.8.0")
 bazel_dep(name = "rules_jvm_external", version = "7.1")
 
 maven = use_extension("@rules_jvm_external//:extensions.bzl", "maven")

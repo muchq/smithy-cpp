@@ -233,7 +233,7 @@ dependencies {
     protocolTestModels("com.disneystreaming.alloy:alloy-protocol-tests:0.3.40")
     protocolTestModels("software.amazon.smithy:smithy-protocol-tests:1.72.1")
 
-    testImplementation(platform("org.junit:junit-bom:6.1.2"))
+    testImplementation(platform("org.junit:junit-bom:6.1.3"))
     testImplementation("org.junit.jupiter:junit-jupiter")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 }

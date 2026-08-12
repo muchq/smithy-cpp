@@ -219,19 +219,19 @@ tasks.withType<Test>().configureEach {
 }
 
 dependencies {
-    api("software.amazon.smithy:smithy-codegen-core:1.72.1")
-    api("software.amazon.smithy:smithy-build:1.72.1")
+    api("software.amazon.smithy:smithy-codegen-core:1.73.0")
+    api("software.amazon.smithy:smithy-build:1.73.0")
     // Trait definitions used by the fixture models.
     // alloy#simpleRestJson — the vendor-neutral REST/JSON protocol (smithy4s).
     // alloy is built against Smithy 1.58, which the whole build now pins to.
     implementation("com.disneystreaming.alloy:alloy-core:0.3.40")
-    implementation("software.amazon.smithy:smithy-protocol-traits:1.72.1")
+    implementation("software.amazon.smithy:smithy-protocol-traits:1.73.0")
     // smithy.test#http{Request,Response}Tests trait definitions.
-    implementation("software.amazon.smithy:smithy-protocol-test-traits:1.72.1")
+    implementation("software.amazon.smithy:smithy-protocol-test-traits:1.73.0")
     // The official conformance suite models (generateProtocolTests classpath only).
     // alloy's simpleRestJson conformance suite.
     protocolTestModels("com.disneystreaming.alloy:alloy-protocol-tests:0.3.40")
-    protocolTestModels("software.amazon.smithy:smithy-protocol-tests:1.72.1")
+    protocolTestModels("software.amazon.smithy:smithy-protocol-tests:1.73.0")
 
     testImplementation(platform("org.junit:junit-bom:6.1.3"))
     testImplementation("org.junit.jupiter:junit-jupiter")

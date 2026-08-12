@@ -156,6 +156,9 @@ smithy::Outcome<RpcV2CborListsInput> DeserializeRpcV2CborListsInput(const smithy
 smithy::Document SerializeRpcV2CborListsOutput(const RpcV2CborListsOutput& value);
 smithy::Outcome<RpcV2CborListsOutput> DeserializeRpcV2CborListsOutput(const smithy::Document& doc);
 
+smithy::Document SerializeRpcV2CborNestedUnion(const RpcV2CborNestedUnion& value);
+smithy::Outcome<RpcV2CborNestedUnion> DeserializeRpcV2CborNestedUnion(const smithy::Document& doc);
+
 smithy::Document SerializeSparseBooleanMap(const std::map<std::string, std::optional<bool>>& value);
 smithy::Outcome<std::map<std::string, std::optional<bool>>> DeserializeSparseBooleanMap(const smithy::Document& doc);
 
@@ -176,6 +179,15 @@ smithy::Outcome<RpcV2CborSparseMapsInput> DeserializeRpcV2CborSparseMapsInput(co
 
 smithy::Document SerializeRpcV2CborSparseMapsOutput(const RpcV2CborSparseMapsOutput& value);
 smithy::Outcome<RpcV2CborSparseMapsOutput> DeserializeRpcV2CborSparseMapsOutput(const smithy::Document& doc);
+
+smithy::Document SerializeRpcV2CborUnion(const RpcV2CborUnion& value);
+smithy::Outcome<RpcV2CborUnion> DeserializeRpcV2CborUnion(const smithy::Document& doc);
+
+smithy::Document SerializeRpcV2CborUnionsInput(const RpcV2CborUnionsInput& value);
+smithy::Outcome<RpcV2CborUnionsInput> DeserializeRpcV2CborUnionsInput(const smithy::Document& doc);
+
+smithy::Document SerializeRpcV2CborUnionsOutput(const RpcV2CborUnionsOutput& value);
+smithy::Outcome<RpcV2CborUnionsOutput> DeserializeRpcV2CborUnionsOutput(const smithy::Document& doc);
 
 smithy::Document SerializeSimpleScalarPropertiesInput(const SimpleScalarPropertiesInput& value);
 smithy::Outcome<SimpleScalarPropertiesInput> DeserializeSimpleScalarPropertiesInput(const smithy::Document& doc);

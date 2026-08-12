@@ -96,6 +96,13 @@ RpcV2CborSparseMapsOutput MinimalRpcV2CborSparseMapsOutput() {
   }();
 }
 
+RpcV2CborUnionsOutput MinimalRpcV2CborUnionsOutput() {
+    return [] {
+    RpcV2CborUnionsOutput v{};
+    return v;
+  }();
+}
+
 SimpleScalarPropertiesOutput MinimalSimpleScalarPropertiesOutput() {
     return [] {
     SimpleScalarPropertiesOutput v{};
@@ -167,6 +174,11 @@ class RecordingHandler : public RpcV2ProtocolHandler {
       return MinimalRpcV2CborSparseMapsOutput();
     }
     std::optional<RpcV2CborSparseMapsInput> lastRpcV2CborSparseMaps;
+    smithy::Outcome<RpcV2CborUnionsOutput> RpcV2CborUnions(const RpcV2CborUnionsInput& input, const smithy::server::RequestContext&) override {
+      lastRpcV2CborUnions = input;
+      return MinimalRpcV2CborUnionsOutput();
+    }
+    std::optional<RpcV2CborUnionsInput> lastRpcV2CborUnions;
     smithy::Outcome<SimpleScalarPropertiesOutput> SimpleScalarProperties(const SimpleScalarPropertiesInput& input, const smithy::server::RequestContext&) override {
       lastSimpleScalarProperties = input;
       return MinimalSimpleScalarPropertiesOutput();
@@ -288,6 +300,20 @@ smithy::http::HttpRequest MinimalRequestForRpcV2CborSparseMaps() {
     return v;
   }();
   (void)client.RpcV2CborSparseMaps(input);
+  return transport->last_request;
+}
+
+smithy::http::HttpRequest MinimalRequestForRpcV2CborUnions() {
+  auto transport = std::make_shared<smithy::testing::CapturingTransport>();
+  smithy::ClientConfig config;
+  config.retry.max_attempts = 1;  // wire-exact tests: no retries
+  config.http_client = transport;
+  auto client = *RpcV2ProtocolClient::Create(std::move(config));
+    RpcV2CborUnionsInput input = [] {
+    RpcV2CborUnionsInput v{};
+    return v;
+  }();
+  (void)client.RpcV2CborUnions(input);
   return transport->last_request;
 }
 
@@ -701,6 +727,50 @@ TEST(RpcV2ProtocolServerResponseTest, RpcV2CborDeserializesZeroValuesInSparseMap
   EXPECT_EQ(response.headers.Get("Content-Type").value_or("<missing>"), "application/cbor");
   EXPECT_EQ(response.headers.Get("smithy-protocol").value_or("<missing>"), "rpc-v2-cbor");
   EXPECT_TRUE(smithy::testing::CborBodyEqualsBase64("v29zcGFyc2VOdW1iZXJNYXC/YXgA/3BzcGFyc2VCb29sZWFuTWFwv2F49P//", response.body));
+}
+
+// Deserializes a tagged union followed by another structure member
+TEST(RpcV2ProtocolServerResponseTest, RpcV2CborDeserializesUnionValue) {
+  class Handler final : public RecordingHandler {
+   public:
+    smithy::Outcome<RpcV2CborUnionsOutput> RpcV2CborUnions(const RpcV2CborUnionsInput& input, const smithy::server::RequestContext&) override {
+      (void)input;
+      return [] {
+  RpcV2CborUnionsOutput v{};
+  v.contents = RpcV2CborUnion::FromStringvalue("foo");
+  v.otherValue = "bar";
+  return v;
+}();
+    }
+  };
+  RpcV2ProtocolServer server(std::make_shared<Handler>());
+  const smithy::http::HttpResponse response = server.Handler()(MinimalRequestForRpcV2CborUnions());
+  EXPECT_EQ(response.status, 200);
+  EXPECT_EQ(response.headers.Get("Content-Type").value_or("<missing>"), "application/cbor");
+  EXPECT_EQ(response.headers.Get("smithy-protocol").value_or("<missing>"), "rpc-v2-cbor");
+  EXPECT_TRUE(smithy::testing::CborBodyEqualsBase64("omhjb250ZW50c6Frc3RyaW5nVmFsdWVjZm9vam90aGVyVmFsdWVjYmFy", response.body));
+}
+
+// Deserializes a nested union followed by another structure member
+TEST(RpcV2ProtocolServerResponseTest, RpcV2CborDeserializesNestedUnionValue) {
+  class Handler final : public RecordingHandler {
+   public:
+    smithy::Outcome<RpcV2CborUnionsOutput> RpcV2CborUnions(const RpcV2CborUnionsInput& input, const smithy::server::RequestContext&) override {
+      (void)input;
+      return [] {
+  RpcV2CborUnionsOutput v{};
+  v.contents = RpcV2CborUnion::FromUnionvalue(RpcV2CborNestedUnion::FromStringvalue("foo"));
+  v.otherValue = "bar";
+  return v;
+}();
+    }
+  };
+  RpcV2ProtocolServer server(std::make_shared<Handler>());
+  const smithy::http::HttpResponse response = server.Handler()(MinimalRequestForRpcV2CborUnions());
+  EXPECT_EQ(response.status, 200);
+  EXPECT_EQ(response.headers.Get("Content-Type").value_or("<missing>"), "application/cbor");
+  EXPECT_EQ(response.headers.Get("smithy-protocol").value_or("<missing>"), "rpc-v2-cbor");
+  EXPECT_TRUE(smithy::testing::CborBodyEqualsBase64("omhjb250ZW50c6FqdW5pb25WYWx1ZaFrc3RyaW5nVmFsdWVjZm9vam90aGVyVmFsdWVjYmFy", response.body));
 }
 
 // Serializes simple scalar properties

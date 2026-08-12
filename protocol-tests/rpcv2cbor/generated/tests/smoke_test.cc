@@ -95,6 +95,13 @@ RpcV2CborSparseMapsOutput MinimalRpcV2CborSparseMapsOutput() {
   }();
 }
 
+RpcV2CborUnionsOutput MinimalRpcV2CborUnionsOutput() {
+    return [] {
+    RpcV2CborUnionsOutput v{};
+    return v;
+  }();
+}
+
 SimpleScalarPropertiesOutput MinimalSimpleScalarPropertiesOutput() {
     return [] {
     SimpleScalarPropertiesOutput v{};
@@ -154,6 +161,10 @@ class SmokeHandler : public RpcV2ProtocolHandler {
     smithy::Outcome<RpcV2CborSparseMapsOutput> RpcV2CborSparseMaps(const RpcV2CborSparseMapsInput& input, const smithy::server::RequestContext&) override {
       (void)input;
       return MinimalRpcV2CborSparseMapsOutput();
+    }
+    smithy::Outcome<RpcV2CborUnionsOutput> RpcV2CborUnions(const RpcV2CborUnionsInput& input, const smithy::server::RequestContext&) override {
+      (void)input;
+      return MinimalRpcV2CborUnionsOutput();
     }
     smithy::Outcome<SimpleScalarPropertiesOutput> SimpleScalarProperties(const SimpleScalarPropertiesInput& input, const smithy::server::RequestContext&) override {
       (void)input;
@@ -297,6 +308,17 @@ TEST(RpcV2ProtocolSmokeTest, RpcV2CborSparseMapsRoundTrips) {
   const auto outcome = client.RpcV2CborSparseMaps(input);
   ASSERT_TRUE(outcome.ok()) << outcome.error().message();
   EXPECT_EQ(*outcome, MinimalRpcV2CborSparseMapsOutput());
+}
+
+TEST(RpcV2ProtocolSmokeTest, RpcV2CborUnionsRoundTrips) {
+  RpcV2ProtocolClient client = MakeClient(std::make_shared<SmokeHandler>());
+    const RpcV2CborUnionsInput input = [] {
+    RpcV2CborUnionsInput v{};
+    return v;
+  }();
+  const auto outcome = client.RpcV2CborUnions(input);
+  ASSERT_TRUE(outcome.ok()) << outcome.error().message();
+  EXPECT_EQ(*outcome, MinimalRpcV2CborUnionsOutput());
 }
 
 TEST(RpcV2ProtocolSmokeTest, SimpleScalarPropertiesRoundTrips) {

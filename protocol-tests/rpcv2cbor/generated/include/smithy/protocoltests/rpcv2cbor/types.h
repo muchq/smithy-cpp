@@ -12,10 +12,13 @@
 #include <ostream>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <variant>
 #include <vector>
 
 #include "smithy/core/blob.h"
 #include "smithy/core/boxed.h"
+#include "smithy/core/fatal.h"
 #include "smithy/core/hash.h"
 #include "smithy/core/print.h"
 #include "smithy/core/timestamp.h"
@@ -1222,6 +1225,72 @@ struct RpcV2CborListsOutput {
 };
 
 
+class RpcV2CborNestedUnion {
+  public:
+    RpcV2CborNestedUnion() = default;
+
+    static RpcV2CborNestedUnion FromStringvalue(std::string value) {
+      RpcV2CborNestedUnion result;
+      result.value_.emplace<1>(std::move(value));
+      return result;
+    }
+    bool is_stringValue() const { return value_.index() == 1; }
+    const std::string& as_stringValue() const {
+      require_is(1, "stringValue");
+      return std::get<1>(value_);
+    }
+    /// The engaged member, or nullptr when another member (or none) is set.
+    const std::string* as_stringValue_or_null() const { return std::get_if<1>(&value_); }
+
+    /// True until one of the From* factories has been used.
+    bool empty() const { return value_.index() == 0; }
+
+    /// Name of the engaged member, "(empty)" until a From* factory has run.
+    const char* case_name() const {
+      static constexpr const char* kNames[] = {"(empty)", "stringValue"};
+      return kNames[value_.index()];
+    }
+
+    /// Applies `visitor` to the engaged member. The visitor must also accept
+    /// std::monostate, which represents the empty state.
+    template <typename Visitor>
+    decltype(auto) visit(Visitor&& visitor) const {
+      return std::visit(std::forward<Visitor>(visitor), value_);
+    }
+
+    /// Debug rendering for logs and tests — for humans, never parse it.
+    void AppendDebugTo(std::string& out) const {
+      out += "RpcV2CborNestedUnion(";
+      switch (value_.index()) {
+        case 1:
+          out += "stringValue = ";
+          smithy::DebugAppend(out, std::get<1>(value_));
+          break;
+        default:
+          break;
+      }
+      out += ')';
+    }
+    std::string DebugString() const { std::string out; AppendDebugTo(out); return out; }
+    friend std::ostream& operator<<(std::ostream& os, const RpcV2CborNestedUnion& value) {
+      return os << value.DebugString();
+    }
+
+    friend bool operator==(const RpcV2CborNestedUnion&, const RpcV2CborNestedUnion&) = default;
+    friend auto operator<=>(const RpcV2CborNestedUnion&, const RpcV2CborNestedUnion&) = default;
+    friend struct std::hash<RpcV2CborNestedUnion>;
+
+  private:
+    void require_is(std::size_t index, const char* requested) const {
+      if (value_.index() != index) {
+        smithy::internal::FatalWrongUnionAccess("RpcV2CborNestedUnion", requested, case_name());
+      }
+    }
+
+    std::variant<std::monostate, std::string> value_;
+};
+
+
 struct RpcV2CborSparseMapsInput {
   std::optional<std::map<std::string, std::optional<GreetingStruct>>> sparseStructMap{};
   std::optional<std::map<std::string, std::optional<std::int32_t>>> sparseNumberMap{};
@@ -1325,6 +1394,153 @@ struct RpcV2CborSparseMapsOutput {
 
   friend bool operator==(const RpcV2CborSparseMapsOutput&, const RpcV2CborSparseMapsOutput&) = default;
   friend auto operator<=>(const RpcV2CborSparseMapsOutput&, const RpcV2CborSparseMapsOutput&) = default;
+};
+
+
+class RpcV2CborUnion {
+  public:
+    RpcV2CborUnion() = default;
+
+    static RpcV2CborUnion FromStringvalue(std::string value) {
+      RpcV2CborUnion result;
+      result.value_.emplace<1>(std::move(value));
+      return result;
+    }
+    bool is_stringValue() const { return value_.index() == 1; }
+    const std::string& as_stringValue() const {
+      require_is(1, "stringValue");
+      return std::get<1>(value_);
+    }
+    /// The engaged member, or nullptr when another member (or none) is set.
+    const std::string* as_stringValue_or_null() const { return std::get_if<1>(&value_); }
+
+    static RpcV2CborUnion FromUnionvalue(RpcV2CborNestedUnion value) {
+      RpcV2CborUnion result;
+      result.value_.emplace<2>(std::move(value));
+      return result;
+    }
+    bool is_unionValue() const { return value_.index() == 2; }
+    const RpcV2CborNestedUnion& as_unionValue() const {
+      require_is(2, "unionValue");
+      return std::get<2>(value_);
+    }
+    /// The engaged member, or nullptr when another member (or none) is set.
+    const RpcV2CborNestedUnion* as_unionValue_or_null() const { return std::get_if<2>(&value_); }
+
+    /// True until one of the From* factories has been used.
+    bool empty() const { return value_.index() == 0; }
+
+    /// Name of the engaged member, "(empty)" until a From* factory has run.
+    const char* case_name() const {
+      static constexpr const char* kNames[] = {"(empty)", "stringValue", "unionValue"};
+      return kNames[value_.index()];
+    }
+
+    /// Applies `visitor` to the engaged member. The visitor must also accept
+    /// std::monostate, which represents the empty state.
+    template <typename Visitor>
+    decltype(auto) visit(Visitor&& visitor) const {
+      return std::visit(std::forward<Visitor>(visitor), value_);
+    }
+
+    /// Debug rendering for logs and tests — for humans, never parse it.
+    void AppendDebugTo(std::string& out) const {
+      out += "RpcV2CborUnion(";
+      switch (value_.index()) {
+        case 1:
+          out += "stringValue = ";
+          smithy::DebugAppend(out, std::get<1>(value_));
+          break;
+        case 2:
+          out += "unionValue = ";
+          smithy::DebugAppend(out, std::get<2>(value_));
+          break;
+        default:
+          break;
+      }
+      out += ')';
+    }
+    std::string DebugString() const { std::string out; AppendDebugTo(out); return out; }
+    friend std::ostream& operator<<(std::ostream& os, const RpcV2CborUnion& value) {
+      return os << value.DebugString();
+    }
+
+    friend bool operator==(const RpcV2CborUnion&, const RpcV2CborUnion&) = default;
+    friend auto operator<=>(const RpcV2CborUnion&, const RpcV2CborUnion&) = default;
+    friend struct std::hash<RpcV2CborUnion>;
+
+  private:
+    void require_is(std::size_t index, const char* requested) const {
+      if (value_.index() != index) {
+        smithy::internal::FatalWrongUnionAccess("RpcV2CborUnion", requested, case_name());
+      }
+    }
+
+    std::variant<std::monostate, std::string, RpcV2CborNestedUnion> value_;
+};
+
+
+struct RpcV2CborUnionsInput {
+  std::optional<RpcV2CborUnion> contents{};
+  std::optional<std::string> otherValue{};
+
+  /// Debug rendering for logs and tests — for humans, never parse it.
+  void AppendDebugTo(std::string& out) const {
+    out += "RpcV2CborUnionsInput{";
+    const char* sep = "";
+    if (this->contents.has_value()) {
+      out += sep;
+      sep = ", ";
+      out += ".contents = ";
+      smithy::DebugAppend(out, *this->contents);
+    }
+    if (this->otherValue.has_value()) {
+      out += sep;
+      sep = ", ";
+      out += ".otherValue = ";
+      smithy::DebugAppend(out, *this->otherValue);
+    }
+    out += '}';
+  }
+  std::string DebugString() const { std::string out; AppendDebugTo(out); return out; }
+  friend std::ostream& operator<<(std::ostream& os, const RpcV2CborUnionsInput& value) {
+    return os << value.DebugString();
+  }
+
+  friend bool operator==(const RpcV2CborUnionsInput&, const RpcV2CborUnionsInput&) = default;
+  friend auto operator<=>(const RpcV2CborUnionsInput&, const RpcV2CborUnionsInput&) = default;
+};
+
+
+struct RpcV2CborUnionsOutput {
+  std::optional<RpcV2CborUnion> contents{};
+  std::optional<std::string> otherValue{};
+
+  /// Debug rendering for logs and tests — for humans, never parse it.
+  void AppendDebugTo(std::string& out) const {
+    out += "RpcV2CborUnionsOutput{";
+    const char* sep = "";
+    if (this->contents.has_value()) {
+      out += sep;
+      sep = ", ";
+      out += ".contents = ";
+      smithy::DebugAppend(out, *this->contents);
+    }
+    if (this->otherValue.has_value()) {
+      out += sep;
+      sep = ", ";
+      out += ".otherValue = ";
+      smithy::DebugAppend(out, *this->otherValue);
+    }
+    out += '}';
+  }
+  std::string DebugString() const { std::string out; AppendDebugTo(out); return out; }
+  friend std::ostream& operator<<(std::ostream& os, const RpcV2CborUnionsOutput& value) {
+    return os << value.DebugString();
+  }
+
+  friend bool operator==(const RpcV2CborUnionsOutput&, const RpcV2CborUnionsOutput&) = default;
+  friend auto operator<=>(const RpcV2CborUnionsOutput&, const RpcV2CborUnionsOutput&) = default;
 };
 
 
@@ -2004,6 +2220,15 @@ struct std::hash<smithy::protocoltests::rpcv2cbor::RpcV2CborListsOutput> {
 };
 
 template <>
+struct std::hash<smithy::protocoltests::rpcv2cbor::RpcV2CborNestedUnion> {
+  std::size_t operator()(const smithy::protocoltests::rpcv2cbor::RpcV2CborNestedUnion& value) const noexcept {
+    const std::size_t member =
+        std::visit([](const auto& v) { return smithy::HashValue(v); }, value.value_);
+    return smithy::HashCombine(value.value_.index(), member);
+  }
+};
+
+template <>
 struct std::hash<smithy::protocoltests::rpcv2cbor::RpcV2CborSparseMapsInput> {
   std::size_t operator()(const smithy::protocoltests::rpcv2cbor::RpcV2CborSparseMapsInput& value) const noexcept {
     std::size_t seed = 0;
@@ -2025,6 +2250,35 @@ struct std::hash<smithy::protocoltests::rpcv2cbor::RpcV2CborSparseMapsOutput> {
     seed = smithy::HashCombine(seed, smithy::HashValue(value.sparseBooleanMap));
     seed = smithy::HashCombine(seed, smithy::HashValue(value.sparseStringMap));
     seed = smithy::HashCombine(seed, smithy::HashValue(value.sparseSetMap));
+    return seed;
+  }
+};
+
+template <>
+struct std::hash<smithy::protocoltests::rpcv2cbor::RpcV2CborUnion> {
+  std::size_t operator()(const smithy::protocoltests::rpcv2cbor::RpcV2CborUnion& value) const noexcept {
+    const std::size_t member =
+        std::visit([](const auto& v) { return smithy::HashValue(v); }, value.value_);
+    return smithy::HashCombine(value.value_.index(), member);
+  }
+};
+
+template <>
+struct std::hash<smithy::protocoltests::rpcv2cbor::RpcV2CborUnionsInput> {
+  std::size_t operator()(const smithy::protocoltests::rpcv2cbor::RpcV2CborUnionsInput& value) const noexcept {
+    std::size_t seed = 0;
+    seed = smithy::HashCombine(seed, smithy::HashValue(value.contents));
+    seed = smithy::HashCombine(seed, smithy::HashValue(value.otherValue));
+    return seed;
+  }
+};
+
+template <>
+struct std::hash<smithy::protocoltests::rpcv2cbor::RpcV2CborUnionsOutput> {
+  std::size_t operator()(const smithy::protocoltests::rpcv2cbor::RpcV2CborUnionsOutput& value) const noexcept {
+    std::size_t seed = 0;
+    seed = smithy::HashCombine(seed, smithy::HashValue(value.contents));
+    seed = smithy::HashCombine(seed, smithy::HashValue(value.otherValue));
     return seed;
   }
 };

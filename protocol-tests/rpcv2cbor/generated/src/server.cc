@@ -488,6 +488,34 @@ RpcV2ProtocolServer::RpcV2ProtocolServer(std::shared_ptr<RpcV2ProtocolHandler> h
     response.body = smithy::cbor::Encode(SerializeRpcV2CborSparseMapsOutput(*outcome)).ToString();
     return response;
   }, "RpcV2CborSparseMaps");
+  (void)router_->Add("POST", "/service/RpcV2Protocol/operation/RpcV2CborUnions", [handler](const smithy::http::HttpRequest& request, const smithy::server::RequestContext& context) -> smithy::http::HttpResponse {
+    if (request.headers.Get("smithy-protocol").value_or("") != "rpc-v2-cbor") {
+      return helpers::CborError(400, "SerializationException", "expected smithy-protocol: rpc-v2-cbor", {});
+    }
+    // Content-Type validation per the rpcv2Cbor spec: a present header must
+    // carry application/cbor (parameters ignored); 415 otherwise.
+    if (const auto content_type = request.headers.Get("content-type"); content_type.has_value() && smithy::http::MediaTypeOf(*content_type) != "application/cbor") {
+      return helpers::CborError(415, "UnsupportedMediaTypeException", "expected content-type: application/cbor", {});
+    }
+    RpcV2CborUnionsInput input{};
+    // An absent body deserializes like an empty CBOR map.
+    smithy::Document body_doc{smithy::DocumentMap{}};
+    if (!request.body.empty()) {
+      auto decoded = smithy::cbor::Decode(smithy::Blob::FromString(request.body));
+      if (!decoded) return helpers::CborError(400, "SerializationException", decoded.error().message(), {});
+      body_doc = *std::move(decoded);
+    }
+    auto parsed = DeserializeRpcV2CborUnionsInput(body_doc);
+    if (!parsed) return helpers::CborError(400, "SerializationException", parsed.error().message(), {});
+    input = *std::move(parsed);
+    auto outcome = handler->RpcV2CborUnions(input, context);
+    if (!outcome) return helpers::ErrorToResponse(outcome.error());
+    smithy::http::HttpResponse response;
+    response.headers.Set("smithy-protocol", "rpc-v2-cbor");
+    response.headers.Set("content-type", "application/cbor");
+    response.body = smithy::cbor::Encode(SerializeRpcV2CborUnionsOutput(*outcome)).ToString();
+    return response;
+  }, "RpcV2CborUnions");
   (void)router_->Add("POST", "/service/RpcV2Protocol/operation/SimpleScalarProperties", [handler](const smithy::http::HttpRequest& request, const smithy::server::RequestContext& context) -> smithy::http::HttpResponse {
     if (request.headers.Get("smithy-protocol").value_or("") != "rpc-v2-cbor") {
       return helpers::CborError(400, "SerializationException", "expected smithy-protocol: rpc-v2-cbor", {});

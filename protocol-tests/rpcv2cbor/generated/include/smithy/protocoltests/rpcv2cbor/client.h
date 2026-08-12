@@ -59,6 +59,8 @@ class RpcV2ProtocolClient {
     /// 4. Lists of structures.
     smithy::Outcome<RpcV2CborListsOutput> RpcV2CborLists(const RpcV2CborListsInput& input) const;
     smithy::Outcome<RpcV2CborSparseMapsOutput> RpcV2CborSparseMaps(const RpcV2CborSparseMapsInput& input) const;
+    /// This operation uses unions for inputs and outputs.
+    smithy::Outcome<RpcV2CborUnionsOutput> RpcV2CborUnions(const RpcV2CborUnionsInput& input) const;
     smithy::Outcome<SimpleScalarPropertiesOutput> SimpleScalarProperties(const SimpleScalarPropertiesInput& input) const;
     smithy::Outcome<SparseNullsOperationOutput> SparseNullsOperation(const SparseNullsOperationInput& input) const;
 

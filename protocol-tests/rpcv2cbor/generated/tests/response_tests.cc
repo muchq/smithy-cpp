@@ -599,6 +599,42 @@ TEST(RpcV2ProtocolResponseTest, RpcV2CborDeserializesZeroValuesInSparseMaps) {
   EXPECT_EQ(*outcome, expected);
 }
 
+// Deserializes a tagged union followed by another structure member
+TEST(RpcV2ProtocolResponseTest, RpcV2CborDeserializesUnionValue) {
+  Fixture fixture = MakeFixture();
+  fixture.transport->next_response.status = 200;
+  fixture.transport->next_response.headers.Set("Content-Type", "application/cbor");
+  fixture.transport->next_response.headers.Set("smithy-protocol", "rpc-v2-cbor");
+  fixture.transport->next_response.body = smithy::testing::FromBase64("omhjb250ZW50c6Frc3RyaW5nVmFsdWVjZm9vam90aGVyVmFsdWVjYmFy");
+  const auto outcome = fixture.client.RpcV2CborUnions(RpcV2CborUnionsInput{});
+  ASSERT_TRUE(outcome.ok()) << outcome.error().message();
+  const RpcV2CborUnionsOutput expected = [] {
+  RpcV2CborUnionsOutput v{};
+  v.contents = RpcV2CborUnion::FromStringvalue("foo");
+  v.otherValue = "bar";
+  return v;
+}();
+  EXPECT_EQ(*outcome, expected);
+}
+
+// Deserializes a nested union followed by another structure member
+TEST(RpcV2ProtocolResponseTest, RpcV2CborDeserializesNestedUnionValue) {
+  Fixture fixture = MakeFixture();
+  fixture.transport->next_response.status = 200;
+  fixture.transport->next_response.headers.Set("Content-Type", "application/cbor");
+  fixture.transport->next_response.headers.Set("smithy-protocol", "rpc-v2-cbor");
+  fixture.transport->next_response.body = smithy::testing::FromBase64("omhjb250ZW50c6FqdW5pb25WYWx1ZaFrc3RyaW5nVmFsdWVjZm9vam90aGVyVmFsdWVjYmFy");
+  const auto outcome = fixture.client.RpcV2CborUnions(RpcV2CborUnionsInput{});
+  ASSERT_TRUE(outcome.ok()) << outcome.error().message();
+  const RpcV2CborUnionsOutput expected = [] {
+  RpcV2CborUnionsOutput v{};
+  v.contents = RpcV2CborUnion::FromUnionvalue(RpcV2CborNestedUnion::FromStringvalue("foo"));
+  v.otherValue = "bar";
+  return v;
+}();
+  EXPECT_EQ(*outcome, expected);
+}
+
 // Serializes simple scalar properties
 TEST(RpcV2ProtocolResponseTest, RpcV2CborSimpleScalarProperties) {
   Fixture fixture = MakeFixture();

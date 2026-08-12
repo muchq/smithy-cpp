@@ -100,6 +100,13 @@ RpcV2CborSparseMapsOutput MinimalRpcV2CborSparseMapsOutput() {
   }();
 }
 
+RpcV2CborUnionsOutput MinimalRpcV2CborUnionsOutput() {
+    return [] {
+    RpcV2CborUnionsOutput v{};
+    return v;
+  }();
+}
+
 SimpleScalarPropertiesOutput MinimalSimpleScalarPropertiesOutput() {
     return [] {
     SimpleScalarPropertiesOutput v{};
@@ -171,6 +178,11 @@ class RecordingHandler : public RpcV2ProtocolHandler {
       return MinimalRpcV2CborSparseMapsOutput();
     }
     std::optional<RpcV2CborSparseMapsInput> lastRpcV2CborSparseMaps;
+    smithy::Outcome<RpcV2CborUnionsOutput> RpcV2CborUnions(const RpcV2CborUnionsInput& input, const smithy::server::RequestContext&) override {
+      lastRpcV2CborUnions = input;
+      return MinimalRpcV2CborUnionsOutput();
+    }
+    std::optional<RpcV2CborUnionsInput> lastRpcV2CborUnions;
     smithy::Outcome<SimpleScalarPropertiesOutput> SimpleScalarProperties(const SimpleScalarPropertiesInput& input, const smithy::server::RequestContext&) override {
       lastSimpleScalarProperties = input;
       return MinimalSimpleScalarPropertiesOutput();
@@ -722,6 +734,50 @@ TEST(RpcV2ProtocolServerRequestTest, RpcV2CborSerializesZeroValuesInSparseMaps) 
   return v;
 }();
   EXPECT_EQ(*handler->lastRpcV2CborSparseMaps, expected);
+}
+
+// Serializes a union followed by another structure member
+TEST(RpcV2ProtocolServerRequestTest, RpcV2CborSerializesUnionValue) {
+  auto handler = std::make_shared<RecordingHandler>();
+  RpcV2ProtocolServer server(handler);
+  smithy::http::HttpRequest request;
+  request.method = "POST";
+  request.target = "/service/RpcV2Protocol/operation/RpcV2CborUnions";
+  request.headers.Set("Accept", "application/cbor");
+  request.headers.Set("Content-Type", "application/cbor");
+  request.headers.Set("smithy-protocol", "rpc-v2-cbor");
+  request.body = smithy::testing::FromBase64("omhjb250ZW50c6Frc3RyaW5nVmFsdWVjZm9vam90aGVyVmFsdWVjYmFy");
+  const smithy::http::HttpResponse response = server.Handler()(request);
+  ASSERT_TRUE(handler->lastRpcV2CborUnions.has_value()) << response.status << " " << response.body;
+  const RpcV2CborUnionsInput expected = [] {
+  RpcV2CborUnionsInput v{};
+  v.contents = RpcV2CborUnion::FromStringvalue("foo");
+  v.otherValue = "bar";
+  return v;
+}();
+  EXPECT_EQ(*handler->lastRpcV2CborUnions, expected);
+}
+
+// Serializes a nested union followed by another structure member
+TEST(RpcV2ProtocolServerRequestTest, RpcV2CborSerializesNestedUnionValue) {
+  auto handler = std::make_shared<RecordingHandler>();
+  RpcV2ProtocolServer server(handler);
+  smithy::http::HttpRequest request;
+  request.method = "POST";
+  request.target = "/service/RpcV2Protocol/operation/RpcV2CborUnions";
+  request.headers.Set("Accept", "application/cbor");
+  request.headers.Set("Content-Type", "application/cbor");
+  request.headers.Set("smithy-protocol", "rpc-v2-cbor");
+  request.body = smithy::testing::FromBase64("omhjb250ZW50c6FqdW5pb25WYWx1ZaFrc3RyaW5nVmFsdWVjZm9vam90aGVyVmFsdWVjYmFy");
+  const smithy::http::HttpResponse response = server.Handler()(request);
+  ASSERT_TRUE(handler->lastRpcV2CborUnions.has_value()) << response.status << " " << response.body;
+  const RpcV2CborUnionsInput expected = [] {
+  RpcV2CborUnionsInput v{};
+  v.contents = RpcV2CborUnion::FromUnionvalue(RpcV2CborNestedUnion::FromStringvalue("foo"));
+  v.otherValue = "bar";
+  return v;
+}();
+  EXPECT_EQ(*handler->lastRpcV2CborUnions, expected);
 }
 
 // Serializes simple scalar properties

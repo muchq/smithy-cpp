@@ -1999,6 +1999,26 @@ smithy::Outcome<RpcV2CborListsOutput> DeserializeRpcV2CborListsOutput(const smit
   return out;
 }
 
+smithy::Document SerializeRpcV2CborNestedUnion(const RpcV2CborNestedUnion& value) {
+  smithy::DocumentMap map;
+  if (value.is_stringValue()) {
+    map.emplace("stringValue", smithy::Document(value.as_stringValue()));
+  }
+  return smithy::Document(std::move(map));
+}
+
+smithy::Outcome<RpcV2CborNestedUnion> DeserializeRpcV2CborNestedUnion(const smithy::Document& doc) {
+  if (!doc.is_map()) return smithy::Error::Serialization("RpcV2CborNestedUnion: expected a map on the wire");
+  if (doc.as_map().size() - (doc.Find("__type") != nullptr ? 1 : 0) != 1) return smithy::Error::Serialization("RpcV2CborNestedUnion: expected exactly one union member");
+  if (const smithy::Document* member = doc.Find("stringValue"); member != nullptr && !member->is_null()) {
+    std::string parsed_member{};
+    if (!member->is_string()) return smithy::Error::Serialization("RpcV2CborNestedUnion.stringValue: unexpected type on the wire");
+    parsed_member = member->as_string();
+    return RpcV2CborNestedUnion::FromStringvalue(std::move(parsed_member));
+  }
+  return smithy::Error::Serialization("RpcV2CborNestedUnion: unknown or missing union member");
+}
+
 smithy::Document SerializeSparseBooleanMap(const std::map<std::string, std::optional<bool>>& value) {
   smithy::DocumentMap map;
   for (const auto& [key, item] : value) {
@@ -2318,6 +2338,114 @@ smithy::Outcome<RpcV2CborSparseMapsOutput> DeserializeRpcV2CborSparseMapsOutput(
         parsed_member = std::move(*parsed);
       }
       out.sparseSetMap = std::move(parsed_member);
+    }
+  }
+  return out;
+}
+
+smithy::Document SerializeRpcV2CborUnion(const RpcV2CborUnion& value) {
+  smithy::DocumentMap map;
+  if (value.is_stringValue()) {
+    map.emplace("stringValue", smithy::Document(value.as_stringValue()));
+  }
+  if (value.is_unionValue()) {
+    map.emplace("unionValue", SerializeRpcV2CborNestedUnion(value.as_unionValue()));
+  }
+  return smithy::Document(std::move(map));
+}
+
+smithy::Outcome<RpcV2CborUnion> DeserializeRpcV2CborUnion(const smithy::Document& doc) {
+  if (!doc.is_map()) return smithy::Error::Serialization("RpcV2CborUnion: expected a map on the wire");
+  if (doc.as_map().size() - (doc.Find("__type") != nullptr ? 1 : 0) != 1) return smithy::Error::Serialization("RpcV2CborUnion: expected exactly one union member");
+  if (const smithy::Document* member = doc.Find("stringValue"); member != nullptr && !member->is_null()) {
+    std::string parsed_member{};
+    if (!member->is_string()) return smithy::Error::Serialization("RpcV2CborUnion.stringValue: unexpected type on the wire");
+    parsed_member = member->as_string();
+    return RpcV2CborUnion::FromStringvalue(std::move(parsed_member));
+  }
+  if (const smithy::Document* member = doc.Find("unionValue"); member != nullptr && !member->is_null()) {
+    RpcV2CborNestedUnion parsed_member{};
+    {
+      auto parsed = DeserializeRpcV2CborNestedUnion(*member);
+      if (!parsed) return std::move(parsed).error();
+      parsed_member = std::move(*parsed);
+    }
+    return RpcV2CborUnion::FromUnionvalue(std::move(parsed_member));
+  }
+  return smithy::Error::Serialization("RpcV2CborUnion: unknown or missing union member");
+}
+
+smithy::Document SerializeRpcV2CborUnionsInput(const RpcV2CborUnionsInput& value) {
+  smithy::DocumentMap map;
+  if (value.contents.has_value()) {
+    map.emplace("contents", SerializeRpcV2CborUnion((*value.contents)));
+  }
+  if (value.otherValue.has_value()) {
+    map.emplace("otherValue", smithy::Document((*value.otherValue)));
+  }
+  return smithy::Document(std::move(map));
+}
+
+smithy::Outcome<RpcV2CborUnionsInput> DeserializeRpcV2CborUnionsInput(const smithy::Document& doc) {
+  if (!doc.is_map()) return smithy::Error::Serialization("RpcV2CborUnionsInput: expected a map on the wire");
+  RpcV2CborUnionsInput out;
+  {
+    const smithy::Document* member = doc.Find("contents");
+    if (member != nullptr && !member->is_null()) {
+      types::RpcV2CborUnion parsed_member{};
+      {
+        auto parsed = DeserializeRpcV2CborUnion(*member);
+        if (!parsed) return std::move(parsed).error();
+        parsed_member = std::move(*parsed);
+      }
+      out.contents = std::move(parsed_member);
+    }
+  }
+  {
+    const smithy::Document* member = doc.Find("otherValue");
+    if (member != nullptr && !member->is_null()) {
+      std::string parsed_member{};
+      if (!member->is_string()) return smithy::Error::Serialization("RpcV2CborUnionsInput.otherValue: unexpected type on the wire");
+      parsed_member = member->as_string();
+      out.otherValue = std::move(parsed_member);
+    }
+  }
+  return out;
+}
+
+smithy::Document SerializeRpcV2CborUnionsOutput(const RpcV2CborUnionsOutput& value) {
+  smithy::DocumentMap map;
+  if (value.contents.has_value()) {
+    map.emplace("contents", SerializeRpcV2CborUnion((*value.contents)));
+  }
+  if (value.otherValue.has_value()) {
+    map.emplace("otherValue", smithy::Document((*value.otherValue)));
+  }
+  return smithy::Document(std::move(map));
+}
+
+smithy::Outcome<RpcV2CborUnionsOutput> DeserializeRpcV2CborUnionsOutput(const smithy::Document& doc) {
+  if (!doc.is_map()) return smithy::Error::Serialization("RpcV2CborUnionsOutput: expected a map on the wire");
+  RpcV2CborUnionsOutput out;
+  {
+    const smithy::Document* member = doc.Find("contents");
+    if (member != nullptr && !member->is_null()) {
+      types::RpcV2CborUnion parsed_member{};
+      {
+        auto parsed = DeserializeRpcV2CborUnion(*member);
+        if (!parsed) return std::move(parsed).error();
+        parsed_member = std::move(*parsed);
+      }
+      out.contents = std::move(parsed_member);
+    }
+  }
+  {
+    const smithy::Document* member = doc.Find("otherValue");
+    if (member != nullptr && !member->is_null()) {
+      std::string parsed_member{};
+      if (!member->is_string()) return smithy::Error::Serialization("RpcV2CborUnionsOutput.otherValue: unexpected type on the wire");
+      parsed_member = member->as_string();
+      out.otherValue = std::move(parsed_member);
     }
   }
   return out;

@@ -331,6 +331,22 @@ smithy::Outcome<RpcV2CborSparseMapsOutput> RpcV2ProtocolClient::RpcV2CborSparseM
   return DeserializeRpcV2CborSparseMapsOutput(*body_doc);
 }
 
+smithy::Outcome<RpcV2CborUnionsOutput> RpcV2ProtocolClient::RpcV2CborUnions(const RpcV2CborUnionsInput& input) const {
+  smithy::http::HttpRequest request;
+  request.method = "POST";
+  request.target = path_prefix_ + "/service/RpcV2Protocol/operation/RpcV2CborUnions";
+  request.headers.Set("smithy-protocol", "rpc-v2-cbor");
+  request.headers.Set("content-type", "application/cbor");
+  request.body = smithy::cbor::Encode(SerializeRpcV2CborUnionsInput(input)).ToString();
+  auto response = Send(std::move(request));
+  if (!response) return std::move(response).error();
+  if (response->status != 200) return helpers::GenericError(helpers::ParseError(*response));
+  if (response->body.empty()) return RpcV2CborUnionsOutput{};
+  auto body_doc = smithy::cbor::Decode(smithy::Blob::FromString(response->body));
+  if (!body_doc) return std::move(body_doc).error();
+  return DeserializeRpcV2CborUnionsOutput(*body_doc);
+}
+
 smithy::Outcome<SimpleScalarPropertiesOutput> RpcV2ProtocolClient::SimpleScalarProperties(const SimpleScalarPropertiesInput& input) const {
   smithy::http::HttpRequest request;
   request.method = "POST";

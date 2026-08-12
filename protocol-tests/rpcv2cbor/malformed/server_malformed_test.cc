@@ -74,6 +74,11 @@ class RecordingHandler : public RpcV2ProtocolHandler {
     ++calls;
     return RpcV2CborSparseMapsOutput{};
   }
+  smithy::Outcome<RpcV2CborUnionsOutput> RpcV2CborUnions(
+      const RpcV2CborUnionsInput&, const smithy::server::RequestContext&) override {
+    ++calls;
+    return RpcV2CborUnionsOutput{};
+  }
   smithy::Outcome<SimpleScalarPropertiesOutput> SimpleScalarProperties(
       const SimpleScalarPropertiesInput&, const smithy::server::RequestContext&) override {
     ++calls;

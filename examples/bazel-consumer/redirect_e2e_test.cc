@@ -29,6 +29,8 @@
 
 namespace {
 
+using acme::redirect::FetchInput;
+using acme::redirect::FetchOutput;
 using acme::redirect::NoSuchSlug;
 using acme::redirect::RedirectorClient;
 using acme::redirect::RedirectorHandler;
@@ -38,9 +40,13 @@ using acme::redirect::ResolveDynamicOutput;
 using acme::redirect::ResolveInput;
 using acme::redirect::ResolveOutput;
 
+constexpr int kOk = 200;
 constexpr int kMovedPermanently = 301;
 constexpr int kFound = 302;
 constexpr int kNotModified = 304;
+
+constexpr char kEtag[] = "\"v1\"";
+constexpr char kContent[] = "hello from the origin";
 
 // A slug table standing in for the shortener's database. "retired" slugs
 // answer 301, "cached" answers 304 (a status RFC 9110 forbids a body on),
@@ -68,6 +74,23 @@ class SlugHandler final : public RedirectorHandler {
     if (input.slug == "retired") status = kMovedPermanently;
     if (input.slug == "cached") status = kNotModified;
     return ResolveDynamicOutput{.status = status, .location = *target};
+  }
+
+  // A conditional GET: the caller's If-None-Match decides 200 or 304.
+  //
+  // The 304 branch deliberately still populates `content` — the fetch already
+  // happened, and a handler that looks up the body before deciding the status
+  // is the ordinary way to write this. Whether that content reaches the wire
+  // is the framework's job, not the handler's: RFC 9110 compliance must not
+  // depend on every handler author remembering to clear the payload.
+  smithy::Outcome<FetchOutput> Fetch(const FetchInput& input,
+                                     const smithy::server::RequestContext&) override {
+    auto target = Lookup(input.slug);
+    if (!target) return std::move(target).error();
+    const bool fresh = input.ifNoneMatch.has_value() && *input.ifNoneMatch == kEtag;
+    return FetchOutput{.status = fresh ? kNotModified : kOk,
+                       .etag = kEtag,
+                       .content = smithy::Blob::FromString(kContent)};
   }
 
  private:
@@ -153,6 +176,23 @@ TEST_P(RedirectE2ETest, UnknownSlugIsStillAModeledError) {
   EXPECT_EQ(missing_dynamic.error().code(), "NoSuchSlug");
 }
 
+// The typed client agrees with the wire: a 304 is a success carrying no
+// payload, not an error and not a stale body.
+TEST_P(RedirectE2ETest, ConditionalFetchRoundTripsThroughTheGeneratedClient) {
+  const auto cold = client_->Fetch(FetchInput{.slug = "abc"});
+  ASSERT_TRUE(cold.ok()) << cold.error().message();
+  EXPECT_EQ(cold->status, kOk);
+  ASSERT_TRUE(cold->content.has_value());
+  EXPECT_EQ(cold->content->ToString(), kContent);
+
+  // The handler populated the payload on this one; the server dropped it, so
+  // the client sees a 304 with nothing attached.
+  const auto conditional = client_->Fetch(FetchInput{.slug = "abc", .ifNoneMatch = kEtag});
+  ASSERT_TRUE(conditional.ok()) << conditional.error().message();
+  EXPECT_EQ(conditional->status, kNotModified);
+  EXPECT_FALSE(conditional->content.has_value());
+}
+
 INSTANTIATE_TEST_SUITE_P(Transports, RedirectE2ETest,
                          ::testing::Values(Transport::kLoopback, Transport::kSocket),
                          [](const auto& info) {
@@ -220,6 +260,48 @@ TEST(RedirectWireTest, NotModifiedCarriesNoBodyAndNoContentType) {
   EXPECT_EQ(live_response->status, kFound);
   EXPECT_EQ(live_response->body, "{}");
   EXPECT_TRUE(live_response->headers.Get("content-type").has_value());
+
+  transport.Stop();
+}
+
+// The same rule on the other branch of the generator. An @httpPayload is
+// written by different code than a document body, and it used to return before
+// the no-content guard was ever reached — so a 304 from a payload-bearing
+// operation still shipped the payload. A conditional GET is how a real service
+// meets that case.
+//
+// The handler hands back a populated payload on the 304 on purpose (see
+// SlugHandler::Fetch): a test where the handler clears it would pass with or
+// without the guard, because there would be nothing to suppress.
+TEST(RedirectWireTest, ANotModifiedFromAPayloadOperationSendsNoPayload) {
+  RedirectorServer server(std::make_shared<SlugHandler>());
+  smithy::http::SocketHttpServer transport;
+  ASSERT_TRUE(transport.Start(server.Handler()).ok());
+  smithy::http::SocketHttpClient client("127.0.0.1", transport.port());
+
+  // Unconditional: 200 with the payload, which is the control — it proves the
+  // fixture serves content at all, so the empty 304 below means something.
+  smithy::http::HttpRequest cold;
+  cold.method = "GET";
+  cold.target = "/c/abc";
+  const auto cold_response = client.Send(cold);
+  ASSERT_TRUE(cold_response.ok()) << cold_response.error().message();
+  EXPECT_EQ(cold_response->status, kOk);
+  EXPECT_EQ(cold_response->body, kContent);
+  EXPECT_EQ(cold_response->headers.Get("ETag").value_or("<missing>"), kEtag);
+
+  // Conditional on the ETag the server just sent: 304, and not one byte of it.
+  smithy::http::HttpRequest conditional;
+  conditional.method = "GET";
+  conditional.target = "/c/abc";
+  conditional.headers.Set("If-None-Match", kEtag);
+  const auto conditional_response = client.Send(conditional);
+  ASSERT_TRUE(conditional_response.ok()) << conditional_response.error().message();
+  EXPECT_EQ(conditional_response->status, kNotModified);
+  EXPECT_EQ(conditional_response->body, "");
+  EXPECT_FALSE(conditional_response->headers.Get("content-type").has_value());
+  // Headers still land: a 304 is required to carry the validator.
+  EXPECT_EQ(conditional_response->headers.Get("ETag").value_or("<missing>"), kEtag);
 
   transport.Stop();
 }

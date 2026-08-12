@@ -78,6 +78,7 @@ final class HttpJsonServerGenerator {
     ProtocolSupport.ErrorResponseSpec spec =
         new ProtocolSupport.ErrorResponseSpec("JsonError", errorTypeHeaderName);
     ProtocolSupport.writeNumericParseHelpers(w);
+    writeStatusAllowsContentHelper(w);
     ProtocolSupport.writeErrorBodyHelper(
         w,
         spec.errorFn(),
@@ -102,6 +103,20 @@ final class HttpJsonServerGenerator {
       }
       writeBuildResponseFunction(w, context, serde, operation);
     }
+  }
+
+  /**
+   * The runtime half of {@link #statusMustNotHaveContent}, for {@code @httpResponseCode} operations
+   * whose status the generator cannot see. Emitted for every service ({@code [[maybe_unused]]}:
+   * only operations that bind {@code @httpResponseCode} call it).
+   */
+  private static void writeStatusAllowsContentHelper(CppWriter w) {
+    w.write("// RFC 9110: 1xx, 204, 205 and 304 responses must not carry content.");
+    w.write("// 3xx may — a redirect body is legal and the conformance suite pins one.");
+    w.openBlock("[[maybe_unused]] bool StatusAllowsContent(int status) {");
+    w.write("return status >= 200 && status != 204 && status != 205 && status != 304;");
+    w.closeBlock("}");
+    w.write("");
   }
 
   /**
@@ -364,34 +379,33 @@ final class HttpJsonServerGenerator {
       HttpBindingCodeGen.writePrefixHeadersWrite(
           w, context, responsePrefixHeaders, "output", "response");
     }
+    // RFC 9110 forbids content on 1xx, 204, 205 and 304 responses, and an
+    // @httpPayload is content exactly as a document body is — a "{}" or a
+    // serialized payload on one of those is a protocol violation, not just
+    // waste (a 304 carrying one misleads every cache in the path).
+    //
+    // When the status is modeled it is decided here; with @httpResponseCode it
+    // is only known at runtime, so the guard has to be too. Everything that
+    // does allow content keeps the restJson1 rule: servers always produce a
+    // JSON body (at minimum "{}").
+    if (responseCode == null && statusMustNotHaveContent(http.getCode())) {
+      w.write("return response;");
+      w.closeBlock("}");
+      w.write("");
+      return;
+    }
+    if (responseCode != null) {
+      w.openBlock("if (helpers::StatusAllowsContent(response.status)) {");
+    }
     if (responsePayload != null) {
       HttpBindingCodeGen.writePayloadWrite(
           w, context, serde, operation, responsePayload, "output", "response", false);
-      w.write("return response;");
-      w.closeBlock("}");
-      w.write("");
-      return;
+    } else {
+      w.write("smithy::DocumentMap body_map;");
+      HttpBindingCodeGen.writeDocumentBodyMap(w, serde, responseBody, "output");
+      w.write("response.headers.Set(\"content-type\", \"application/json\");");
+      w.write("response.body = smithy::json::Encode(smithy::Document(std::move(body_map)));");
     }
-    // RFC 9110 forbids a body on 1xx, 204 and 304 responses; a JSON "{}" on
-    // one of those is a protocol violation, not just waste (a 304 carrying a
-    // body misleads every cache between here and the client).
-    if (responseCode == null && statusMustNotHaveBody(http.getCode())) {
-      w.write("return response;");
-      w.closeBlock("}");
-      w.write("");
-      return;
-    }
-    // With @httpResponseCode the status is only known at runtime, so the guard
-    // has to be too. Everything else keeps the restJson1 rule: servers always
-    // produce a JSON body (at minimum "{}").
-    if (responseCode != null) {
-      w.openBlock(
-          "if (response.status >= 200 && response.status != 204 && response.status != 304) {");
-    }
-    w.write("smithy::DocumentMap body_map;");
-    HttpBindingCodeGen.writeDocumentBodyMap(w, serde, responseBody, "output");
-    w.write("response.headers.Set(\"content-type\", \"application/json\");");
-    w.write("response.body = smithy::json::Encode(smithy::Document(std::move(body_map)));");
     if (responseCode != null) {
       w.closeBlock("}");
     }
@@ -401,12 +415,16 @@ final class HttpJsonServerGenerator {
   }
 
   /**
-   * RFC 9110 statuses that must never carry a response body: the 1xx informational range, 204 No
-   * Content, and 304 Not Modified. 3xx is deliberately absent — a redirect *may* carry a body, and
-   * alloy's own CustomCodeOutput conformance case pins "{}" at status 399.
+   * RFC 9110 statuses that must never carry response content: the 1xx informational range (§15.2),
+   * 204 No Content (§15.3.5), 205 Reset Content (§15.3.6), and 304 Not Modified (§15.4.5). 3xx is
+   * deliberately absent — a redirect *may* carry content, and alloy's own CustomCodeOutput
+   * conformance case pins "{}" at status 399.
+   *
+   * <p>Kept in step with the generated {@code helpers::StatusAllowsContent}, which decides the same
+   * question at runtime for {@code @httpResponseCode} operations.
    */
-  private static boolean statusMustNotHaveBody(int status) {
-    return (status >= 100 && status <= 199) || status == 204 || status == 304;
+  private static boolean statusMustNotHaveContent(int status) {
+    return (status >= 100 && status <= 199) || status == 204 || status == 205 || status == 304;
   }
 
   /** The runtime Router/WebSocketRouter pattern for an @http URI (shared grammar). */

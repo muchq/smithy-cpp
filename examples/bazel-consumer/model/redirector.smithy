@@ -12,7 +12,7 @@ namespace acme.redirect
 /// generator, and only one of them used to work.
 service Redirector {
     version: "2026-01-01"
-    operations: [Resolve, ResolveDynamic]
+    operations: [Resolve, ResolveDynamic, Fetch]
 }
 
 /// The status is fixed, so it rides the @http trait.
@@ -60,6 +60,37 @@ operation ResolveDynamic {
         @required
         @httpHeader("Location")
         location: String
+    }
+
+    errors: [NoSuchSlug]
+}
+
+/// A conditional fetch: 200 with the content, or 304 with none. The other
+/// half of the no-content rule — here the body is an @httpPayload rather than
+/// a document, which the generator writes on a different branch, so a guard
+/// that only covered document bodies would still put content on the 304.
+@readonly
+@http(method: "GET", uri: "/c/{slug}")
+operation Fetch {
+    input := {
+        @required
+        @httpLabel
+        slug: String
+
+        @httpHeader("If-None-Match")
+        ifNoneMatch: String
+    }
+
+    output := {
+        @required
+        @httpResponseCode
+        status: Integer
+
+        @httpHeader("ETag")
+        etag: String
+
+        @httpPayload
+        content: Blob
     }
 
     errors: [NoSuchSlug]

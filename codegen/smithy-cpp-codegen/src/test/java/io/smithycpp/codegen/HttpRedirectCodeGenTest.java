@@ -103,6 +103,36 @@ class HttpRedirectCodeGenTest {
       }
       """;
 
+  /** An @httpPayload body plus a runtime-chosen status: the other body-writing branch. */
+  private static final String PAYLOAD_MODEL =
+      """
+      $version: "2.0"
+      namespace test.rest
+
+      use alloy#simpleRestJson
+
+      @simpleRestJson
+      service Svc { version: "1", operations: [Fetch] }
+
+      @readonly
+      @http(method: "GET", uri: "/c/{slug}")
+      operation Fetch {
+          input := {
+              @required
+              @httpLabel
+              slug: String
+          }
+          output := {
+              @required
+              @httpResponseCode
+              status: Integer
+
+              @httpPayload
+              content: Blob
+          }
+      }
+      """;
+
   private static MockManifest generate(String model) {
     return PluginTestHarness.generate(model, "test.rest#Svc", "test::rest");
   }
@@ -153,13 +183,10 @@ class HttpRedirectCodeGenTest {
         function(
             generate(DYNAMIC_MODEL).expectFileString("/src/server.cc"), "BuildResolveResponse");
 
-    // RFC 9110: no body on 1xx/204/304. The status is only known at runtime
-    // here, so the guard is emitted around the body write rather than decided
-    // at generation time.
-    assertTrue(
-        build.contains(
-            "if (response.status >= 200 && response.status != 204 && response.status != 304) {"),
-        build);
+    // RFC 9110: no content on 1xx/204/205/304. The status is only known at
+    // runtime here, so the guard is emitted around the body write rather than
+    // decided at generation time.
+    assertTrue(build.contains("if (helpers::StatusAllowsContent(response.status)) {"), build);
     assertTrue(build.contains("response.body = smithy::json::Encode("), build);
   }
 
@@ -176,6 +203,39 @@ class HttpRedirectCodeGenTest {
     assertFalse(build.contains("response.body = smithy::json::Encode("), build);
     assertFalse(
         build.contains("response.headers.Set(\"content-type\", \"application/json\");"), build);
+  }
+
+  /**
+   * An {@code @httpPayload} is content too, and it is written by a different branch — one that used
+   * to return before the no-content guard was reached, so a payload-bearing operation shipped its
+   * payload on a 304 (and, before this, on a modeled 204).
+   */
+  @Test
+  void aPayloadIsGuardedByTheSameNoContentRule() {
+    String build =
+        function(generate(PAYLOAD_MODEL).expectFileString("/src/server.cc"), "BuildFetchResponse");
+
+    assertTrue(build.contains("if (helpers::StatusAllowsContent(response.status)) {"), build);
+    // The payload write is inside the guard, not ahead of it.
+    int guard = build.indexOf("helpers::StatusAllowsContent");
+    int payload = build.indexOf("response.body");
+    assertTrue(payload > guard, "payload written outside the no-content guard:\n" + build);
+  }
+
+  /** 205 Reset Content is as bodiless as 204 (RFC 9110 §15.3.6), statically and at runtime. */
+  @Test
+  void resetContentCarriesNoBody() {
+    String modeled = NO_CONTENT_MODEL.replace("code: 204", "code: 205");
+    String build =
+        function(generate(modeled).expectFileString("/src/server.cc"), "BuildEraseResponse");
+    assertTrue(build.contains("response.status = 205;"), build);
+    assertFalse(build.contains("response.body = smithy::json::Encode("), build);
+
+    // And the runtime predicate the @httpResponseCode path consults.
+    String server = generate(DYNAMIC_MODEL).expectFileString("/src/server.cc");
+    assertTrue(
+        server.contains("return status >= 200 && status != 204 && status != 205 && status != 304;"),
+        server);
   }
 
   /**

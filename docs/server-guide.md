@@ -469,10 +469,14 @@ then part of the contract rather than something the handler can get wrong. Reach
 `@httpResponseCode` when the handler genuinely chooses (permanent vs temporary).
 
 Generated clients treat 3xx as success, so a redirect arrives as a typed output carrying
-`location` — not as an error. Bodies follow RFC 9110: 1xx, 204, and 304 responses are sent with
-no body and no `Content-Type`, and every other status keeps the protocol's rule that a server
-always sends a JSON body (at minimum `{}`). A 3xx *may* carry a body, so redirects get the
-`{}` — harmless to browsers, which read `Location`.
+`location` — not as an error. Bodies follow RFC 9110: 1xx, 204, 205, and 304 responses are sent
+with no content and no `Content-Type`, and every other status keeps the protocol's rule that a
+server always sends a JSON body (at minimum `{}`). A 3xx *may* carry a body, so redirects get
+the `{}` — harmless to browsers, which read `Location`.
+
+The no-content rule covers an `@httpPayload` exactly as it covers a document body, and it is
+enforced on the wire rather than left to the handler: a handler that fills in a payload and
+*then* selects 304 — the ordinary shape of a conditional GET — still produces a bodiless 304.
 
 `examples/bazel-consumer/redirect_e2e_test.cc` drives both spellings end to end, including
 raw-socket assertions on the bytes.

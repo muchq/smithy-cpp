@@ -15,10 +15,6 @@ namespace smithy::protocoltests::simplerestjson {
 
 // Generated from smithy.test#httpResponseTests (client cases),
 // including the cases attached to modeled error shapes.
-//
-// Excluded cases (protocol-test-exclusions.txt; the list must only shrink):
-//   CustomCodeOutput (response) — 3xx @httpResponseCode is not treated as a success status
-
 namespace {
 
 struct Fixture {
@@ -52,6 +48,21 @@ TEST(PizzaAdminServiceResponseTest, AddMenuItemResult) {
   AddMenuItemOutput v{};
   v.itemId = "1";
   v.added = smithy::Timestamp::FromEpochMilliseconds(1576540098000LL);
+  return v;
+}();
+  EXPECT_EQ(*outcome, expected);
+}
+
+// respect the httpResponseCode trait
+TEST(PizzaAdminServiceResponseTest, CustomCodeOutput) {
+  Fixture fixture = MakeFixture();
+  fixture.transport->next_response.status = 399;
+  fixture.transport->next_response.body = "{}";
+  const auto outcome = fixture.client.CustomCode(CustomCodeInput{});
+  ASSERT_TRUE(outcome.ok()) << outcome.error().message();
+  const CustomCodeOutput expected = [] {
+  CustomCodeOutput v{};
+  v.code = 399;
   return v;
 }();
   EXPECT_EQ(*outcome, expected);

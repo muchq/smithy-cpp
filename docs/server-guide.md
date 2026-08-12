@@ -416,6 +416,67 @@ call → response pair. The wire is pinned by the authored suite in
 `Accumulate` session ([examples/jsonrpc2](../examples/jsonrpc2)), over the in-memory
 pair and real Beast WebSockets, both seams, TLS included.
 
+## Redirects (3xx)
+
+A redirect is a modeled operation like any other: bind `Location` with `@httpHeader` and let
+the status come from either the `@http` trait or an `@httpResponseCode` member.
+
+```smithy
+/// Fixed status: it rides the @http trait. @suppress is required — Smithy's own
+/// HttpResponseCodeSemantics validator fails the model with "Expected an `http`
+/// code in the 2xx range, but found 302", which stops model assembly.
+@readonly
+@suppress(["HttpResponseCodeSemantics"])
+@http(method: "GET", uri: "/r/{slug}", code: 302)
+operation Resolve {
+    input := {
+        @required
+        @httpLabel
+        slug: String
+    }
+    output := {
+        @required
+        @httpHeader("Location")
+        location: String
+    }
+}
+
+/// Status chosen per request — 301 for a retired slug, 302 for a live one.
+/// @httpResponseCode carries it, so the modeled code stays 200 and no
+/// suppression is needed.
+@readonly
+@http(method: "GET", uri: "/d/{slug}")
+operation ResolveDynamic {
+    input := {
+        @required
+        @httpLabel
+        slug: String
+    }
+    output := {
+        @required
+        @httpResponseCode
+        status: Integer
+
+        @required
+        @httpHeader("Location")
+        location: String
+    }
+}
+```
+
+Prefer the fixed form when the status never varies: it needs the suppression, but the status is
+then part of the contract rather than something the handler can get wrong. Reach for
+`@httpResponseCode` when the handler genuinely chooses (permanent vs temporary).
+
+Generated clients treat 3xx as success, so a redirect arrives as a typed output carrying
+`location` — not as an error. Bodies follow RFC 9110: 1xx, 204, and 304 responses are sent with
+no body and no `Content-Type`, and every other status keeps the protocol's rule that a server
+always sends a JSON body (at minimum `{}`). A 3xx *may* carry a body, so redirects get the
+`{}` — harmless to browsers, which read `Location`.
+
+`examples/bazel-consumer/redirect_e2e_test.cc` drives both spellings end to end, including
+raw-socket assertions on the bytes.
+
 ## Generated smoke tests
 
 Every generated module ships `tests/smoke_test.cc` (target `:smoke_test` in the module's
@@ -453,7 +514,8 @@ bodies, structure/union/document JSON bodies) and `@httpPrefixHeaders` — malfo
 rejected with the exact error identity (strict booleans, bounds-checked integers, strict
 timestamps, single-member unions, `SerializationException`/`UnsupportedMediaTypeException`/
 `NotAcceptableException` headers), and handler outputs/errors serialize to the exact wire
-responses — `@httpResponseCode`, 204 No Content bodies suppressed, Content-Type (415) and
+responses — `@httpResponseCode`, bodies suppressed on the statuses RFC 9110 forbids one on
+(1xx, 204, 304), Content-Type (415) and
 Accept (406) enforcement (blob payloads without `@mediaType` accept anything), and
 all-query-params `@httpQueryParams` maps. Ambiguous route tables fail at generation time.
 Routes for `@requestCompression` operations transparently gunzip request bodies arriving with

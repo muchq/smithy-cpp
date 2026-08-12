@@ -165,10 +165,12 @@ smithy::http::HttpResponse BuildAddBookResponse(const types::AddBookOutput& outp
   smithy::http::HttpResponse response;
   response.status = 201;
   response.status = static_cast<int>(output.status);
-  smithy::DocumentMap body_map;
-  body_map.emplace("isbn", smithy::Document(output.isbn));
-  response.headers.Set("content-type", "application/json");
-  response.body = smithy::json::Encode(smithy::Document(std::move(body_map)));
+  if (response.status >= 200 && response.status != 204 && response.status != 304) {
+    smithy::DocumentMap body_map;
+    body_map.emplace("isbn", smithy::Document(output.isbn));
+    response.headers.Set("content-type", "application/json");
+    response.body = smithy::json::Encode(smithy::Document(std::move(body_map)));
+  }
   return response;
 }
 

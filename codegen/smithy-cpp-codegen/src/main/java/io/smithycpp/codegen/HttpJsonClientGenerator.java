@@ -181,9 +181,13 @@ final class HttpJsonClientGenerator {
     w.write("auto response = Send(std::move(request));");
     w.write("if (!response) return std::move(response).error();");
     if (responseCode != null) {
-      // The service chooses the (2xx) status at runtime via @httpResponseCode.
+      // The service chooses the status at runtime via @httpResponseCode, so
+      // there is no modeled code to compare against: success is anything that
+      // is not an error status. 3xx counts — a modeled redirect binds Location
+      // and carries no error body — and the static branch below already
+      // accepts one, so rejecting it here was an inconsistency, not a policy.
       w.write(
-          "if (response->status < 200 || response->status > 299) return $L;",
+          "if (response->status < 200 || response->status >= 400) return $L;",
           ProtocolSupport.errorExpression(context, service, operation));
     } else {
       w.write(

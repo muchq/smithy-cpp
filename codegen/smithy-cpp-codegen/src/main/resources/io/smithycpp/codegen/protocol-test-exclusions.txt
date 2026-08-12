@@ -42,9 +42,6 @@ smithy.protocoltests.rpcv2Cbor#RpcV2Protocol server-request RpcV2CborSupportsNaN
 
 # simpleRestJson (alloy) conformance exclusions.
 
-# @httpResponseCode with a 3xx value: the client treats only 2xx as success.
-alloy.test#PizzaAdminService response CustomCodeOutput 3xx @httpResponseCode is not treated as a success status
-
 
 # alloy-protocol-tests 0.3.32+ Primitives operation: PrimitiveEncodings.duration
 # targets alloy#Duration, a bigDecimal the generator rejects until bigDecimal

@@ -338,9 +338,11 @@ smithy::http::HttpResponse BuildCustomCodeResponse(const types::CustomCodeOutput
   smithy::http::HttpResponse response;
   response.status = 200;
   if (output.code.has_value()) response.status = static_cast<int>(*output.code);
-  smithy::DocumentMap body_map;
-  response.headers.Set("content-type", "application/json");
-  response.body = smithy::json::Encode(smithy::Document(std::move(body_map)));
+  if (response.status >= 200 && response.status != 204 && response.status != 304) {
+    smithy::DocumentMap body_map;
+    response.headers.Set("content-type", "application/json");
+    response.body = smithy::json::Encode(smithy::Document(std::move(body_map)));
+  }
   return response;
 }
 

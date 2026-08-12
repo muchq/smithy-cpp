@@ -372,21 +372,41 @@ final class HttpJsonServerGenerator {
       w.write("");
       return;
     }
-    if (http.getCode() == 204) {
-      // 204 No Content responses must not carry a body (or content-type).
+    // RFC 9110 forbids a body on 1xx, 204 and 304 responses; a JSON "{}" on
+    // one of those is a protocol violation, not just waste (a 304 carrying a
+    // body misleads every cache between here and the client).
+    if (responseCode == null && statusMustNotHaveBody(http.getCode())) {
       w.write("return response;");
       w.closeBlock("}");
       w.write("");
       return;
     }
-    // restJson1 servers always produce a JSON body (at minimum "{}").
+    // With @httpResponseCode the status is only known at runtime, so the guard
+    // has to be too. Everything else keeps the restJson1 rule: servers always
+    // produce a JSON body (at minimum "{}").
+    if (responseCode != null) {
+      w.openBlock(
+          "if (response.status >= 200 && response.status != 204 && response.status != 304) {");
+    }
     w.write("smithy::DocumentMap body_map;");
     HttpBindingCodeGen.writeDocumentBodyMap(w, serde, responseBody, "output");
     w.write("response.headers.Set(\"content-type\", \"application/json\");");
     w.write("response.body = smithy::json::Encode(smithy::Document(std::move(body_map)));");
+    if (responseCode != null) {
+      w.closeBlock("}");
+    }
     w.write("return response;");
     w.closeBlock("}");
     w.write("");
+  }
+
+  /**
+   * RFC 9110 statuses that must never carry a response body: the 1xx informational range, 204 No
+   * Content, and 304 Not Modified. 3xx is deliberately absent — a redirect *may* carry a body, and
+   * alloy's own CustomCodeOutput conformance case pins "{}" at status 399.
+   */
+  private static boolean statusMustNotHaveBody(int status) {
+    return (status >= 100 && status <= 199) || status == 204 || status == 304;
   }
 
   /** The runtime Router/WebSocketRouter pattern for an @http URI (shared grammar). */

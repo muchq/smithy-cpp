@@ -64,6 +64,12 @@ namespace helpers {
   return value;
 }
 
+// RFC 9110: 1xx, 204, 205 and 304 responses must not carry content.
+// 3xx may — a redirect body is legal and the conformance suite pins one.
+[[maybe_unused]] bool StatusAllowsContent(int status) {
+  return status >= 200 && status != 204 && status != 205 && status != 304;
+}
+
 smithy::http::HttpResponse JsonError(int status, const std::string& code, const std::string& message, smithy::DocumentMap body) {
   if (!code.empty()) body.insert_or_assign("__type", smithy::Document(code));
   if (!message.empty()) body.insert_or_assign("message", smithy::Document(message));
@@ -338,9 +344,11 @@ smithy::http::HttpResponse BuildCustomCodeResponse(const types::CustomCodeOutput
   smithy::http::HttpResponse response;
   response.status = 200;
   if (output.code.has_value()) response.status = static_cast<int>(*output.code);
-  smithy::DocumentMap body_map;
-  response.headers.Set("content-type", "application/json");
-  response.body = smithy::json::Encode(smithy::Document(std::move(body_map)));
+  if (helpers::StatusAllowsContent(response.status)) {
+    smithy::DocumentMap body_map;
+    response.headers.Set("content-type", "application/json");
+    response.body = smithy::json::Encode(smithy::Document(std::move(body_map)));
+  }
   return response;
 }
 

@@ -66,6 +66,46 @@ smithy_cpp_server_library(
     service = "acme.todo#Todo",
 )
 
+# The redirect service (issue #184): REST-only, because @httpResponseCode and
+# a Location header are HTTP concepts no RPC binding carries.
+smithy_cpp_client_library(
+    name = "redirector_client",
+    srcs = [
+        "model/bindings/redirector.smithy",
+        "model/redirector.smithy",
+    ],
+    namespace = "acme::redirect",
+    service = "acme.redirect#Redirector",
+)
+
+smithy_cpp_server_library(
+    name = "redirector_server",
+    srcs = [
+        "model/bindings/redirector.smithy",
+        "model/redirector.smithy",
+    ],
+    namespace = "acme::redirect",
+    service = "acme.redirect#Redirector",
+)
+
+# 3xx acceptance out of tree: both spellings of a modeled redirect through the
+# generated pair, plus raw-socket assertions on the bytes a browser actually
+# reads. No Beast, so it runs behind a download-blocking proxy.
+cc_test(
+    name = "redirect_e2e_test",
+    size = "small",
+    srcs = ["redirect_e2e_test.cc"],
+    copts = SMITHY_COPTS,
+    deps = [
+        ":redirector_client",
+        ":redirector_server",
+        "@googletest//:gtest_main",
+        "@smithy_cpp//runtime:client",
+        "@smithy_cpp//runtime:http",
+        "@smithy_cpp//runtime:server",
+    ],
+)
+
 # Production-transport acceptance: the same generated service on
 # BeastServerTransport + BeastHttpClient::FromConfig (the production-guide
 # wiring), including the handler-executor and throwing-handler paths. Behind

@@ -388,7 +388,7 @@ smithy::Outcome<CustomCodeOutput> PizzaAdminServiceClient::CustomCode(const Cust
   request.target = std::move(target);
   auto response = Send(std::move(request));
   if (!response) return std::move(response).error();
-  if (response->status < 200 || response->status > 299) return helpers::ParseCustomCodeError(*response);
+  if (response->status < 200 || response->status >= 400) return helpers::ParseCustomCodeError(*response);
   CustomCodeOutput out{};
   out.code = static_cast<std::int32_t>(response->status);
   return out;

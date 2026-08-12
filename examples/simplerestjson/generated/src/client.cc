@@ -172,7 +172,7 @@ smithy::Outcome<AddBookOutput> BookstoreClient::AddBook(const AddBookInput& inpu
   request.headers.Set("content-type", "application/json");
   auto response = Send(std::move(request));
   if (!response) return std::move(response).error();
-  if (response->status < 200 || response->status > 299) return helpers::GenericError(helpers::ParseError(*response));
+  if (response->status < 200 || response->status >= 400) return helpers::GenericError(helpers::ParseError(*response));
   AddBookOutput out{};
   auto body_doc = smithy::json::Decode(response->body.empty() ? "{}" : response->body);
   if (!body_doc) return std::move(body_doc).error();

@@ -6,6 +6,39 @@ policy in [docs/versioning.md](docs/versioning.md).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Modeled redirects: a 3xx `@httpResponseCode` is a success, not an error**
+  (#184). Generated clients tested `status < 200 || status > 299` when the
+  output bound `@httpResponseCode`, so every modeled redirect came back as a
+  `GenericError` with its `Location` binding discarded — while the
+  static-`@http(code:)` branch of the same generator accepted one, because it
+  compares against the modeled status. The window is now "not an error status",
+  which makes the two spellings agree and removes the `CustomCodeOutput`
+  conformance exclusion.
+- **Bodiless statuses no longer carry content** (#184). Only 204 was
+  special-cased, so a 304 (reachable through `@httpResponseCode`) went out with
+  `content-type: application/json` and a `{}` body — a response RFC 9110
+  forbids content on, and one that misleads every cache in the path. 1xx, 205
+  (§15.3.6) and 304 now join 204, and the rule covers `@httpPayload` responses
+  as well as document bodies: the payload branch returned before the old check
+  was reached, so a payload-bearing operation shipped its payload on a 304 (and
+  on a modeled 204, which predates this change). With `@httpResponseCode` the
+  check is emitted at runtime as `helpers::StatusAllowsContent`, since the
+  status is not known at generation time. 3xx is deliberately not included: a
+  redirect *may* carry content, and alloy's `CustomCodeOutput` case pins `{}` at
+  status 399.
+
+### Added
+
+- **Redirects are documented and covered** — a "Redirects (3xx)" section in
+  [docs/server-guide.md](docs/server-guide.md) covering both spellings and the
+  `@suppress(["HttpResponseCodeSemantics"])` a static non-2xx `@http` code
+  needs (Smithy's own validator stops model assembly without it), plus
+  `examples/bazel-consumer/redirect_e2e_test.cc`: both spellings end to end
+  over loopback and a real socket, with raw-socket assertions on the bytes a
+  browser actually reads.
+
 ## [0.2.0] - 2026-08-02
 
 Event-stream hardening: a terminal transition with both an async send and an

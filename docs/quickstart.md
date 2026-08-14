@@ -58,7 +58,7 @@ git_override(
     tag = "v0.2.0",
 )
 
-bazel_dep(name = "googletest", version = "1.17.0.bcr.2")
+bazel_dep(name = "googletest", version = "1.18.0")
 bazel_dep(name = "rules_cc", version = "0.2.22")
 bazel_dep(name = "rules_shell", version = "0.8.0")  # only for shell-driven tests (sh_test)
 ```

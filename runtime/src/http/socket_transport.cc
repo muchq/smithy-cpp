@@ -57,12 +57,12 @@ bool SendAll(SocketFd fd, std::string_view data) {
 // hostile-input bank and the fuzz harness exercise it without a socket). For
 // responses without Content-Length the body extends to EOF (we always
 // request/emit Connection: close).
-Outcome<Http1Message> ReadMessage(SocketFd fd, bool body_until_eof) {
+Outcome<Http1Message> ReadMessage(SocketFd fd, bool body_until_eof, bool has_body = true) {
   return ReadHttp1Message(
       [fd](char* buffer, std::size_t capacity) {
         return static_cast<long>(recv(fd, buffer, capacity, 0));
       },
-      body_until_eof);
+      body_until_eof, has_body);
 }
 
 }  // namespace
@@ -125,7 +125,11 @@ Outcome<HttpResponse> SocketHttpClient::Send(const HttpRequest& request) {
     close(fd);
     return Error::Transport("http: write failed");
   }
-  auto message = ReadMessage(fd, /*body_until_eof=*/true);
+  // A HEAD response is headers only, however its Content-Length reads
+  // (issue #192) — honouring that header would block for a body the server
+  // is required not to send.
+  auto message = ReadMessage(fd, /*body_until_eof=*/true,
+                             /*has_body=*/request.method != "HEAD");
   close(fd);
   if (!message) return std::move(message).error();
 
@@ -190,12 +194,19 @@ void SocketHttpServer::AcceptLoop() {
     SetTimeouts(connection, 30000);
     auto message = ReadMessage(connection, /*body_until_eof=*/false);
     HttpResponse response;
+    // Framing needs the method (issue #192), and the request is moved into
+    // the handler below. False when the request line never parsed: there is
+    // no method then, and the 400 carries its own body.
+    bool head = false;
     if (message) {
       // Request line: "GET /target HTTP/1.1".
       HttpRequest request;
       if (!ParseRequestLine(message->start_line, &request.method, &request.target)) {
         response = HttpResponse{400, {}, "malformed request line"};
       } else {
+        // Exact: the method token is case-sensitive (RFC 9110 §9.1), and the
+        // router matches it by exact string.
+        head = request.method == "HEAD";
         request.headers = std::move(message->headers);
         request.body = std::move(message->body);
         request.peer_address =
@@ -223,6 +234,10 @@ void SocketHttpServer::AcceptLoop() {
       response.headers.Set("content-type", "text/plain");
       response.body = "internal error: response header contains forbidden bytes";
     }
+    // Content-Length is the length the equivalent GET would report, whether
+    // or not the body follows it — that is what makes a HEAD response
+    // answerable (RFC 9110 §9.3.2), and it is computed before the body is
+    // withheld below.
     std::string wire = "HTTP/1.1 " + std::to_string(response.status) + " \r\n";
     wire += "content-length: " + std::to_string(response.body.size()) + "\r\n";
     wire += "connection: close\r\n";
@@ -233,7 +248,14 @@ void SocketHttpServer::AcceptLoop() {
       wire += "\r\n";
     }
     wire += "\r\n";
-    wire += response.body;
+    // A HEAD response is the headers and nothing else. This transport closes
+    // every connection, so a stray body could not desynchronize a subsequent
+    // request the way it does on the keep-alive Beast path — but a client
+    // reading Content-Length bytes after a HEAD is reading the next thing on
+    // the socket either way.
+    if (!head) {
+      wire += response.body;
+    }
     SendAll(connection, wire);
     close(connection);
   }

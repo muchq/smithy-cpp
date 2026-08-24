@@ -1,7 +1,12 @@
 #include "smithy/http/socket_transport.h"
 
+#include <arpa/inet.h>
 #include <gtest/gtest.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
+#include <cstdint>
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
@@ -11,6 +16,35 @@
 
 namespace smithy::http {
 namespace {
+
+// Sends raw bytes to the loopback server and returns the raw response, so an
+// assertion can see the exact wire framing. SocketHttpClient would not do:
+// it knows a HEAD response has no body and stops after the headers, so a
+// parsed round-trip reports an empty body whether or not the server sent one.
+std::string RawRoundTrip(int port, const std::string& request_bytes) {
+  const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) return {};
+  timeval timeout{.tv_sec = 10, .tv_usec = 0};
+  (void)::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(static_cast<std::uint16_t>(port));
+  if (::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr) != 1 ||
+      ::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+    ::close(fd);
+    return {};
+  }
+  (void)::send(fd, request_bytes.data(), request_bytes.size(), 0);
+  std::string received;
+  char scratch[1024];
+  for (;;) {
+    const auto n = ::recv(fd, scratch, sizeof(scratch), 0);
+    if (n <= 0) break;
+    received.append(scratch, static_cast<std::size_t>(n));
+  }
+  ::close(fd);
+  return received;
+}
 
 TEST(SocketTransportTest, RoundTripsOverRealSockets) {
   SocketHttpServer server;
@@ -310,6 +344,41 @@ TEST(SocketTransportTest, StartLogsTheTestOnlyRelegationNotice) {
   ASSERT_TRUE(started.ok());
   EXPECT_NE(log.str().find("test-only"), std::string::npos) << log.str();
   EXPECT_NE(log.str().find("BeastServerTransport"), std::string::npos) << log.str();
+}
+
+// The same rule as the Beast path (issue #192): a HEAD response is the
+// headers the equivalent GET would send, Content-Length included, and no
+// body. This transport closes every connection, so a stray body cannot
+// desynchronize a later request here — but a client reading Content-Length
+// bytes after a HEAD is still reading something that is not its body.
+TEST(SocketTransportTest, HeadResponsesCarryTheGetsLengthAndNoBody) {
+  SocketHttpServer server;
+  ASSERT_TRUE(server
+                  .Start([](const HttpRequest&) {
+                    HttpResponse response;
+                    response.status = 200;
+                    response.headers.Set("content-type", "application/json");
+                    response.body = R"({"id":"abc"})";
+                    return response;
+                  })
+                  .ok());
+  ASSERT_GT(server.port(), 0);
+
+  const std::string raw = RawRoundTrip(server.port(), "HEAD /thing HTTP/1.1\r\nhost: x\r\n\r\n");
+  ASSERT_FALSE(raw.empty());
+
+  const auto header_end = raw.find("\r\n\r\n");
+  ASSERT_NE(header_end, std::string::npos) << raw;
+  EXPECT_EQ(raw.substr(header_end + 4), "") << "HEAD answered with a body: " << raw;
+  EXPECT_NE(raw.find("content-length: 12"), std::string::npos) << raw;
+
+  // The GET is untouched, which is what makes that length meaningful.
+  const std::string get = RawRoundTrip(server.port(), "GET /thing HTTP/1.1\r\nhost: x\r\n\r\n");
+  const auto get_header_end = get.find("\r\n\r\n");
+  ASSERT_NE(get_header_end, std::string::npos) << get;
+  EXPECT_EQ(get.substr(get_header_end + 4), R"({"id":"abc"})") << get;
+
+  server.Stop();
 }
 
 }  // namespace

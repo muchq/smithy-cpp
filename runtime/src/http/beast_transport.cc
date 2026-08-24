@@ -125,6 +125,41 @@ bhttp::response<bhttp::string_body> ToWireResponse(HttpResponse response, bool k
   return wire;
 }
 
+// The same response as a HEAD answers it: every header the GET would send,
+// Content-Length included, and no body (RFC 9110 §9.3.2). Writing the body
+// anyway desynchronizes a keep-alive connection, because the peer reads those
+// bytes as the start of the next response (issue #192).
+//
+// A handler cannot do this itself. The body comes from the generated
+// serializer, and IsFramingHeader above strips any Content-Length a handler
+// sets, so suppressing the body in a handler would answer Content-Length: 0 —
+// a different claim about the resource than the GET makes.
+//
+// empty_body, not a string_body with the body cleared out. Beast's serializer
+// writes what the body holds, so a cleared string_body under a Content-Length
+// of N is a message it never finishes: the headers go out, the write never
+// completes, and the connection sits until the request timeout closes it —
+// the next request on it never answered. empty_body carries no body to write
+// and takes its length from the header, which is the HEAD contract exactly.
+bhttp::response<bhttp::empty_body> ToHeadWireResponse(
+    const bhttp::response<bhttp::string_body>& full, bool keep_alive) {
+  bhttp::response<bhttp::empty_body> wire;
+  wire.result(full.result());
+  wire.version(full.version());
+  for (const auto& field : full) {
+    // Content-Length is restored below from the body the GET would have sent;
+    // prepare_payload() may also have chosen to send none (204, 304), and
+    // that choice is preserved by not adding one here.
+    if (beast::iequals(field.name_string(), "content-length")) continue;
+    wire.insert(field.name_string(), field.value());
+  }
+  wire.keep_alive(keep_alive);
+  if (full.find(bhttp::field::content_length) != full.end()) {
+    wire.content_length(full.body().size());
+  }
+  return wire;
+}
+
 // The connection's remote peer for the request, rejection, and
 // connection-event stamps, rendered by the shared formatter
 // (server_dispatch.h) so the transports' stamps cannot drift; empty when
@@ -1333,15 +1368,22 @@ struct BeastServerTransport::State : std::enable_shared_from_this<State> {
   void Dispatch(const std::shared_ptr<Stream>& stream, HttpRequest request, bool keep_alive) {
     // The request's own peer stamp rides along for the write-phase event:
     // by write time the peer may already be gone (an RST while the handler
-    // ran) and a fresh getpeername would come back empty.
+    // ran) and a fresh getpeername would come back empty. The method rides
+    // along for the same reason — framing needs it (issue #192) and the
+    // request is gone by write time.
     std::string peer = request.peer_address;
+    // Exact, not case-insensitive: RFC 9110 §9.1 makes the method token
+    // case-sensitive, and Router::Route looks its bucket up by exact string
+    // (router.cc). Matching loosely here would strip the body from a "head"
+    // request that routing had already treated as some other method.
+    const bool head = request.method == "HEAD";
     if (handler_pool == nullptr) {
       Respond(stream, InvokeHandlerGuarded(handler, std::move(request)), keep_alive,
-              std::move(peer));
+              std::move(peer), head);
       return;
     }
     asio::post(*handler_pool, [weak = weak_from_this(), stream, request = std::move(request),
-                               keep_alive, peer = std::move(peer)]() mutable {
+                               keep_alive, peer = std::move(peer), head]() mutable {
       // A handler-pool worker has no RunIoThread backstop, so contain any
       // throw here — the handler itself is already contained by
       // InvokeHandlerGuarded, leaving only a framework bad_alloc, which must
@@ -1353,13 +1395,13 @@ struct BeastServerTransport::State : std::enable_shared_from_this<State> {
         }
         HttpResponse response = InvokeHandlerGuarded(self->handler, std::move(request));
         asio::post(stream->get_executor(), [weak, stream, response = std::move(response),
-                                            keep_alive, peer = std::move(peer)]() mutable {
+                                            keep_alive, peer = std::move(peer), head]() mutable {
           auto self = weak.lock();
           if (self == nullptr) {
             CloseStream(*stream);
             return;
           }
-          self->Respond(stream, std::move(response), keep_alive, std::move(peer));
+          self->Respond(stream, std::move(response), keep_alive, std::move(peer), head);
         });
       });
     });
@@ -1371,7 +1413,7 @@ struct BeastServerTransport::State : std::enable_shared_from_this<State> {
   // through to the wire object instead of being copied per request.
   template <typename Stream>
   void Respond(const std::shared_ptr<Stream>& stream, HttpResponse response, bool keep_alive,
-               std::string peer) {
+               std::string peer, bool head) {
     if (FindUnsafeHeader(response.headers).has_value()) {
       // The header-injection defense (issue #109): a handler echoing
       // CR/LF-bearing text into a header is response splitting. The whole
@@ -1382,8 +1424,28 @@ struct BeastServerTransport::State : std::enable_shared_from_this<State> {
       response.headers.Set("content-type", "text/plain");
       response.body = "internal error: response header contains forbidden bytes";
     }
-    auto wire = std::make_shared<bhttp::response<bhttp::string_body>>(
-        ToWireResponse(std::move(response), keep_alive));
+    auto full = ToWireResponse(std::move(response), keep_alive);
+    if (head) {
+      // Same headers, no body (issue #192). Its own message type, because a
+      // string_body emptied under a non-zero Content-Length is a message
+      // Beast never finishes writing, which strands the connection instead of
+      // serving the next request on it.
+      WriteWire(stream,
+                std::make_shared<bhttp::response<bhttp::empty_body>>(
+                    ToHeadWireResponse(full, keep_alive)),
+                keep_alive, std::move(peer));
+      return;
+    }
+    WriteWire(stream, std::make_shared<bhttp::response<bhttp::string_body>>(std::move(full)),
+              keep_alive, std::move(peer));
+  }
+
+  // The write itself, shared by both response shapes above: the completion
+  // arm — drop accounting, keep-alive teardown, the next read — is the same
+  // whether or not a body follows the headers.
+  template <typename Stream, typename Message>
+  void WriteWire(const std::shared_ptr<Stream>& stream, std::shared_ptr<Message> wire,
+                 bool keep_alive, std::string peer) {
     // Each wire phase gets its own request_timeout_seconds budget: Beast
     // expiries are absolute and outlive the op, so without a re-arm the
     // write would run under the deadline set at READ start — and a handler
@@ -1452,7 +1514,10 @@ struct BeastServerTransport::State : std::enable_shared_from_this<State> {
             // response on the plain HTTP connection, keep-alive intact.
             self->active.fetch_add(1);
             const bool keep_alive = parser->get().keep_alive() && !self->stopping;
-            self->Respond(stream, *std::move(refusal), keep_alive, std::move(request.peer_address));
+            // An upgrade request is a GET by definition (RFC 6455 §4.1), so
+            // the refusal is never a HEAD response.
+            self->Respond(stream, *std::move(refusal), keep_alive, std::move(request.peer_address),
+                          /*head=*/false);
             return;
           }
           self->CompleteUpgrade(stream, parser, std::move(request));

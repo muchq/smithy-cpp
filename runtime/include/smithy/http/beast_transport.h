@@ -42,11 +42,19 @@ class BeastServerTransport : public HttpServerTransport {
   // written before a handler chain exists, which Observe middleware therefore
   // never sees (issue #46). method/target may be empty when the request never
   // parsed that far (a 431 can fire mid-headers).
+  //
+  // The `= {}` on the strings is not redundant with their default constructor
+  // (issue #193). Clang's -Wmissing-designated-field-initializers, on under
+  // -Wextra since Clang 19, fires on a designated initializer that omits a
+  // field lacking an NSDMI — so without these a caller describing exactly the
+  // case above, `{.status = 431}`, would not compile under this repo's
+  // --config=werror, and would have to spell out the empties to say what the
+  // omission already said.
   struct RejectedRequest {
     int status = 0;
-    std::string peer_address;
-    std::string method;
-    std::string target;
+    std::string peer_address = {};
+    std::string method = {};
+    std::string target = {};
   };
 
   // A connection the transport terminated without delivering a response
@@ -82,9 +90,9 @@ class BeastServerTransport : public HttpServerTransport {
     };
     Kind kind = Kind::kDropped;
     // "ip:port"; may be empty when the socket can no longer report it.
-    std::string peer_address;
+    std::string peer_address = {};
     // The transport's own error text (error_code::message()).
-    std::string detail;
+    std::string detail = {};
     // Time spent in the failing phase (handshake, read, or write).
     std::chrono::microseconds elapsed{0};
   };

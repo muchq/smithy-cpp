@@ -442,6 +442,7 @@ cc_test(
         ":connection_event_recorder",
         ":http",
         ":http_beast",
+        ":server",
         "@googletest//:gtest_main",
     ],
 )

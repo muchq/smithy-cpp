@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "smithy/http/socket_transport.h"
+#include "smithy/server/middleware.h"
 #include "smithy/testing/connection_event_recorder.h"
 
 namespace smithy::http {
@@ -1215,6 +1216,172 @@ TEST(BeastTransportTest, StopIsIdempotentAndRestartable) {
   ASSERT_TRUE(response.ok()) << response.error().message();
   EXPECT_EQ(response->status, 205);
   server.Stop();
+}
+
+// RFC 9110 §9.3.2: a HEAD response carries the headers the equivalent GET
+// would carry and no body. Framing is the transport's call — a handler has no
+// say in it — so this is where the method has to be read (issue #192).
+//
+// Raw bytes, not SocketHttpClient: that client stops after the headers of a
+// HEAD response, so a parsed round-trip reports an empty body whether or not
+// the server sent one. Only the wire can say.
+TEST(BeastTransportTest, HeadResponsesCarryTheGetsLengthAndNoBody) {
+  BeastServerTransport server;
+  ASSERT_TRUE(server
+                  .Start([](const HttpRequest&) {
+                    HttpResponse response;
+                    response.status = 200;
+                    response.headers.Set("content-type", "application/json");
+                    // The body a GET would produce. The handler cannot tell
+                    // the difference, which is the point — a generated
+                    // serializer has no method to branch on.
+                    response.body = R"({"id":"abc"})";
+                    return response;
+                  })
+                  .ok());
+
+  const std::string raw =
+      RawRoundTrip(server.port(), "HEAD /thing HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n");
+  ASSERT_FALSE(raw.empty());
+
+  const auto header_end = raw.find("\r\n\r\n");
+  ASSERT_NE(header_end, std::string::npos) << raw;
+  EXPECT_EQ(raw.substr(header_end + 4), "") << "HEAD answered with a body: " << raw;
+
+  // Not merely absent: the length the GET would report, so a client can size
+  // the resource without fetching it. Content-Length: 0 would be a different
+  // and false claim about it.
+  const std::string headers = AsciiLowerCopy(raw.substr(0, header_end));
+  EXPECT_NE(headers.find("content-length: 12"), std::string::npos) << raw;
+  EXPECT_NE(headers.find("content-type: application/json"), std::string::npos) << raw;
+
+  // The GET is untouched, which is what makes the length above meaningful.
+  const std::string get =
+      RawRoundTrip(server.port(), "GET /thing HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n");
+  const auto get_header_end = get.find("\r\n\r\n");
+  ASSERT_NE(get_header_end, std::string::npos) << get;
+  EXPECT_EQ(get.substr(get_header_end + 4), R"({"id":"abc"})") << get;
+
+  server.Stop();
+}
+
+TEST(BeastTransportTest, TheHealthEndpointsHeadReportsTheGetsLength) {
+  // HealthEndpoint answers HEAD itself rather than routing it, so it is the
+  // one shipped handler that can get the HEAD shape wrong on its own. Framing
+  // belongs to the transport: a handler that empties the body to "omit" it
+  // has not omitted anything, it has changed the length to 0 — a false answer
+  // to the only question a HEAD asks.
+  BeastServerTransport server;
+  ASSERT_TRUE(server
+                  .Start(smithy::server::Chain({smithy::server::HealthEndpoint("/livez")},
+                                               [](const HttpRequest&) {
+                                                 HttpResponse response;
+                                                 response.status = 404;
+                                                 response.body = "no route";
+                                                 return response;
+                                               }))
+                  .ok());
+
+  const std::string head =
+      RawRoundTrip(server.port(), "HEAD /livez HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n");
+  const std::string get =
+      RawRoundTrip(server.port(), "GET /livez HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n");
+  ASSERT_FALSE(head.empty());
+  ASSERT_FALSE(get.empty());
+
+  const auto head_end = head.find("\r\n\r\n");
+  const auto get_end = get.find("\r\n\r\n");
+  ASSERT_NE(head_end, std::string::npos) << head;
+  ASSERT_NE(get_end, std::string::npos) << get;
+
+  EXPECT_EQ(get.substr(get_end + 4), R"({"status":"healthy"})") << get;
+  EXPECT_EQ(head.substr(head_end + 4), "") << "HEAD answered with a body: " << head;
+
+  const std::string head_headers = AsciiLowerCopy(head.substr(0, head_end));
+  EXPECT_NE(head_headers.find("content-length: 20"), std::string::npos)
+      << "HEAD did not report the GET's length: " << head;
+  EXPECT_NE(head_headers.find("content-type: application/json"), std::string::npos) << head;
+
+  server.Stop();
+}
+
+// The failure a stray HEAD body actually causes. Sequential on one
+// connection, the way StripsHandlerSetFramingHeaders checks the same
+// property: read the HEAD response to its end, then ask for something else
+// on the same socket. Any body the HEAD emitted is still queued, so it
+// arrives where the second response should begin.
+TEST(BeastTransportTest, AHeadLeavesTheConnectionInSync) {
+  BeastServerTransport server;
+  ASSERT_TRUE(server
+                  .Start([](const HttpRequest&) {
+                    HttpResponse response;
+                    response.status = 200;
+                    response.body = "0123456789";
+                    return response;
+                  })
+                  .ok());
+
+  const int fd = ConnectLoopback(server.port());
+  ASSERT_GE(fd, 0);
+  const std::string head = "HEAD /a HTTP/1.1\r\nhost: x\r\n\r\n";
+  ASSERT_EQ(::send(fd, head.data(), head.size(), 0), static_cast<ssize_t>(head.size()));
+
+  std::string received;
+  char scratch[512];
+  auto read_more = [&] {
+    const auto n = ::recv(fd, scratch, sizeof(scratch), 0);
+    ASSERT_GT(n, 0) << "connection closed before the HEAD response completed: " << received;
+    received.append(scratch, static_cast<std::size_t>(n));
+  };
+  std::size_t header_end = std::string::npos;
+  while ((header_end = received.find("\r\n\r\n")) == std::string::npos) read_more();
+
+  // The headers say ten bytes follow. None do, and the next thing on the
+  // socket is the answer to the next request.
+  EXPECT_NE(AsciiLowerCopy(received.substr(0, header_end)).find("content-length: 10"),
+            std::string::npos)
+      << received;
+  EXPECT_EQ(received.substr(header_end + 4), "") << "HEAD answered with a body: " << received;
+
+  const std::string get = "GET /b HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n";
+  ASSERT_EQ(::send(fd, get.data(), get.size(), 0), static_cast<ssize_t>(get.size()));
+  std::string tail;
+  while (tail.find("0123456789") == std::string::npos) {
+    const auto n = ::recv(fd, scratch, sizeof(scratch), 0);
+    ASSERT_GT(n, 0) << "the GET was never served in sync: " << tail;
+    tail.append(scratch, static_cast<std::size_t>(n));
+  }
+  // One response, one body: the GET's. Two would mean the HEAD sent one too.
+  EXPECT_EQ(CountOccurrences(tail, "0123456789"), 1u) << tail;
+  EXPECT_EQ(CountOccurrences(tail, "HTTP/1.1 200"), 1u) << tail;
+
+  ::close(fd);
+  server.Stop();
+}
+
+// Both structs are described to callers as having optional fields — a
+// rejection whose request never parsed has no method or target, and a
+// connection event whose socket is gone has no peer address. Saying that by
+// omission has to compile.
+//
+// This is a compile-time assertion wearing a test's clothes: under
+// --config=werror, dropping the `= {}` from either struct makes these
+// designated initializers a -Wmissing-designated-field-initializers error and
+// the target fails to build (issue #193). The runtime EXPECTs are here so the
+// test also states what the omitted fields are worth.
+TEST(BeastTransportTest, OptionalFieldsCanBeOmittedFromDesignatedInitializers) {
+  const BeastServerTransport::RejectedRequest rejected{.status = 431};
+  EXPECT_EQ(rejected.status, 431);
+  EXPECT_TRUE(rejected.peer_address.empty());
+  EXPECT_TRUE(rejected.method.empty());
+  EXPECT_TRUE(rejected.target.empty());
+
+  const BeastServerTransport::ConnectionEvent event{
+      .kind = BeastServerTransport::ConnectionEvent::Kind::kFramingError};
+  EXPECT_EQ(event.kind, BeastServerTransport::ConnectionEvent::Kind::kFramingError);
+  EXPECT_TRUE(event.peer_address.empty());
+  EXPECT_TRUE(event.detail.empty());
+  EXPECT_EQ(event.elapsed, std::chrono::microseconds{0});
 }
 
 }  // namespace

@@ -1,16 +1,112 @@
 #include "smithy/http/socket_transport.h"
 
+#include <arpa/inet.h>
 #include <gtest/gtest.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
+#include <cstdint>
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <utility>
 
 #include "smithy/http/trace_context.h"
 
 namespace smithy::http {
 namespace {
+
+// Sends raw bytes to the loopback server and returns the raw response, so an
+// assertion can see the exact wire framing. SocketHttpClient would not do:
+// it knows a HEAD response has no body and stops after the headers, so a
+// parsed round-trip reports an empty body whether or not the server sent one.
+std::string RawRoundTrip(int port, const std::string& request_bytes) {
+  const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) return {};
+  timeval timeout{.tv_sec = 10, .tv_usec = 0};
+  (void)::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(static_cast<std::uint16_t>(port));
+  if (::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr) != 1 ||
+      ::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+    ::close(fd);
+    return {};
+  }
+  (void)::send(fd, request_bytes.data(), request_bytes.size(), 0);
+  std::string received;
+  char scratch[1024];
+  for (;;) {
+    const auto n = ::recv(fd, scratch, sizeof(scratch), 0);
+    if (n <= 0) break;
+    received.append(scratch, static_cast<std::size_t>(n));
+  }
+  ::close(fd);
+  return received;
+}
+
+// A one-shot loopback peer that answers the first request with fixed bytes
+// and closes, so a test can hand SocketHttpClient a response no compliant
+// server would write.
+class CannedPeer {
+ public:
+  explicit CannedPeer(std::string response_bytes) {
+    listener_ = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (listener_ < 0) return;
+    const int one = 1;
+    (void)::setsockopt(listener_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    if (::bind(listener_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 ||
+        ::listen(listener_, 1) != 0) {
+      return;
+    }
+    socklen_t length = sizeof(addr);
+    if (::getsockname(listener_, reinterpret_cast<sockaddr*>(&addr), &length) != 0) return;
+    port_ = ntohs(addr.sin_port);
+    thread_ = std::thread([this, bytes = std::move(response_bytes)] {
+      const int connection = ::accept(listener_, nullptr, nullptr);
+      if (connection < 0) return;
+      char scratch[2048];
+      (void)::recv(connection, scratch, sizeof(scratch), 0);
+      (void)::send(connection, bytes.data(), bytes.size(), 0);
+      ::close(connection);
+    });
+  }
+
+  ~CannedPeer() {
+    if (thread_.joinable()) {
+      // A dial of our own so a still-waiting accept() returns and the join
+      // does too, whether or not the test got that far.
+      const int nudge = ::socket(AF_INET, SOCK_STREAM, 0);
+      if (nudge >= 0) {
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = htons(static_cast<std::uint16_t>(port_));
+        (void)::connect(nudge, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+        ::close(nudge);
+      }
+      thread_.join();
+    }
+    if (listener_ >= 0) ::close(listener_);
+  }
+
+  CannedPeer(const CannedPeer&) = delete;
+  CannedPeer& operator=(const CannedPeer&) = delete;
+
+  int port() const { return port_; }
+
+ private:
+  int listener_ = -1;
+  int port_ = 0;
+  std::thread thread_;
+};
 
 TEST(SocketTransportTest, RoundTripsOverRealSockets) {
   SocketHttpServer server;
@@ -310,6 +406,93 @@ TEST(SocketTransportTest, StartLogsTheTestOnlyRelegationNotice) {
   ASSERT_TRUE(started.ok());
   EXPECT_NE(log.str().find("test-only"), std::string::npos) << log.str();
   EXPECT_NE(log.str().find("BeastServerTransport"), std::string::npos) << log.str();
+}
+
+// The same rule as the Beast path (issue #192): a HEAD response is the
+// headers the equivalent GET would send, Content-Length included, and no
+// body. This transport closes every connection, so a stray body cannot
+// desynchronize a later request here — but a client reading Content-Length
+// bytes after a HEAD is still reading something that is not its body.
+TEST(SocketTransportTest, HeadResponsesCarryTheGetsLengthAndNoBody) {
+  SocketHttpServer server;
+  ASSERT_TRUE(server
+                  .Start([](const HttpRequest&) {
+                    HttpResponse response;
+                    response.status = 200;
+                    response.headers.Set("content-type", "application/json");
+                    response.body = R"({"id":"abc"})";
+                    return response;
+                  })
+                  .ok());
+  ASSERT_GT(server.port(), 0);
+
+  const std::string raw = RawRoundTrip(server.port(), "HEAD /thing HTTP/1.1\r\nhost: x\r\n\r\n");
+  ASSERT_FALSE(raw.empty());
+
+  const auto header_end = raw.find("\r\n\r\n");
+  ASSERT_NE(header_end, std::string::npos) << raw;
+  EXPECT_EQ(raw.substr(header_end + 4), "") << "HEAD answered with a body: " << raw;
+  EXPECT_NE(raw.find("content-length: 12"), std::string::npos) << raw;
+
+  // The GET is untouched, which is what makes that length meaningful.
+  const std::string get = RawRoundTrip(server.port(), "GET /thing HTTP/1.1\r\nhost: x\r\n\r\n");
+  const auto get_header_end = get.find("\r\n\r\n");
+  ASSERT_NE(get_header_end, std::string::npos) << get;
+  EXPECT_EQ(get.substr(get_header_end + 4), R"({"id":"abc"})") << get;
+
+  server.Stop();
+}
+
+TEST(SocketTransportTest, AHeadThroughTheClientKeepsTheLengthAndReturnsNoBody) {
+  // The pair end to end: the server writes the GET's length with no octets,
+  // and the client returns from that rather than waiting on the length.
+  SocketHttpServer server;
+  ASSERT_TRUE(server
+                  .Start([](const HttpRequest&) {
+                    HttpResponse response;
+                    response.status = 200;
+                    response.headers.Set("content-type", "application/json");
+                    response.body = R"({"id":"abc"})";
+                    return response;
+                  })
+                  .ok());
+  ASSERT_GT(server.port(), 0);
+
+  SocketHttpClient client("127.0.0.1", server.port(), /*timeout_ms=*/5000);
+  HttpRequest request;
+  request.method = "HEAD";
+  request.target = "/thing";
+  const auto response = client.Send(request);
+  ASSERT_TRUE(response.ok()) << response.error().message();
+  EXPECT_EQ(response->status, 200);
+  EXPECT_EQ(response->body, "");
+  EXPECT_EQ(response->headers.Get("content-length").value_or(""), "12");
+
+  server.Stop();
+}
+
+TEST(SocketTransportTest, TheClientReadsAHeadResponseAsHeadersWhateverFollowsThem) {
+  // Content-Length on a HEAD response describes the GET, so the client stops
+  // at the headers instead of treating it as a count of bytes to read. Bytes
+  // a non-compliant peer sends anyway are not this response's body.
+  CannedPeer peer(
+      "HTTP/1.1 200 OK\r\n"
+      "content-length: 12\r\n"
+      "content-type: application/json\r\n"
+      "connection: close\r\n"
+      "\r\n"
+      R"({"id":"abc"})");
+  ASSERT_GT(peer.port(), 0);
+
+  SocketHttpClient client("127.0.0.1", peer.port(), /*timeout_ms=*/5000);
+  HttpRequest request;
+  request.method = "HEAD";
+  request.target = "/thing";
+  const auto response = client.Send(request);
+  ASSERT_TRUE(response.ok()) << response.error().message();
+  EXPECT_EQ(response->status, 200);
+  EXPECT_EQ(response->body, "");
+  EXPECT_EQ(response->headers.Get("content-length").value_or(""), "12");
 }
 
 }  // namespace

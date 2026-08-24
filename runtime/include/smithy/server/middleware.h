@@ -89,7 +89,9 @@ struct ReadinessCheck {
 //          HealthEndpoint("/readyz", {{"db", [&] { return db.Alive(); }}})},
 //         server.Handler());
 //
-// Bodies are omitted for HEAD.
+// A HEAD is answered like the GET, body included: the transport withholds
+// the octets and keeps the length (RFC 9110 §9.3.2), and that length is
+// what the HEAD was asking for.
 Middleware HealthEndpoint(std::string path = "/health", std::vector<ReadinessCheck> checks = {});
 
 // One served request, as seen from outside the router.

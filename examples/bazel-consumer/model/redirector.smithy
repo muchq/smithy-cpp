@@ -12,7 +12,7 @@ namespace acme.redirect
 /// generator, and only one of them used to work.
 service Redirector {
     version: "2026-01-01"
-    operations: [Resolve, ResolveDynamic, Fetch]
+    operations: [Resolve, ResolveDynamic, Fetch, Probe]
 }
 
 /// The status is fixed, so it rides the @http trait.
@@ -86,6 +86,37 @@ operation Fetch {
         @httpResponseCode
         status: Integer
 
+        @httpHeader("ETag")
+        etag: String
+
+        @httpPayload
+        content: Blob
+    }
+
+    errors: [NoSuchSlug]
+}
+
+/// HEAD on the resource Fetch serves: the length the GET would report, and
+/// not one octet of it (RFC 9110 §9.3.2).
+///
+/// The other half of the no-content rule from Fetch, and the harder half.
+/// There the *status* forbids the body, so the generator can see it in the
+/// response it is building. Here the status is an ordinary 200 that normally
+/// carries one — only the request method forbids it, and the serializer never
+/// sees the request. A handler cannot cover for that either: it returns the
+/// same output shape whichever method arrived, and clearing the payload would
+/// answer Content-Length: 0, which is a different and false claim about the
+/// resource.
+@readonly
+@http(method: "HEAD", uri: "/c/{slug}")
+operation Probe {
+    input := {
+        @required
+        @httpLabel
+        slug: String
+    }
+
+    output := {
         @httpHeader("ETag")
         etag: String
 

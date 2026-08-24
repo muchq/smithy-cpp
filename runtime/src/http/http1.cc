@@ -15,7 +15,8 @@ constexpr std::size_t kMaxBodyBytes = std::size_t{64} * 1024 * 1024;
 
 }  // namespace
 
-Outcome<Http1Message> ReadHttp1Message(const Http1ReadFn& read, bool body_until_eof) {
+Outcome<Http1Message> ReadHttp1Message(const Http1ReadFn& read, bool body_until_eof,
+                                       bool has_body) {
   std::string buffer;
   std::size_t header_end = std::string::npos;
   std::array<char, 8192> chunk{};
@@ -65,6 +66,13 @@ Outcome<Http1Message> ReadHttp1Message(const Http1ReadFn& read, bool body_until_
   }
 
   message.body = buffer.substr(header_end + 4);
+  if (!has_body) {
+    // The headers are the whole message. Anything already in the buffer past
+    // them belongs to whatever comes next on the connection, not to this
+    // response, so it is not claimed as a body.
+    message.body.clear();
+    return message;
+  }
   if (const auto length_text = message.headers.Get("content-length")) {
     // Strict RFC 9110 field value: digits only. strtoull alone would also
     // accept "+4", leading whitespace, or an empty value (as 0) — laxity a

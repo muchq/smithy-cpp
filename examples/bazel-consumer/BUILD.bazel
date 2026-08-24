@@ -106,6 +106,25 @@ cc_test(
     ],
 )
 
+# HEAD acceptance out of tree (issue #192): a modeled HEAD through the
+# generated server, asserted on raw wire bytes because both shipped clients
+# would report an empty body either way. No Beast, so it runs behind a
+# download-blocking proxy.
+cc_test(
+    name = "head_e2e_test",
+    size = "small",
+    srcs = ["head_e2e_test.cc"],
+    copts = SMITHY_COPTS,
+    deps = [
+        ":redirector_client",
+        ":redirector_server",
+        "@googletest//:gtest_main",
+        "@smithy_cpp//runtime:client",
+        "@smithy_cpp//runtime:http",
+        "@smithy_cpp//runtime:server",
+    ],
+)
+
 # Production-transport acceptance: the same generated service on
 # BeastServerTransport + BeastHttpClient::FromConfig (the production-guide
 # wiring), including the handler-executor and throwing-handler paths. Behind

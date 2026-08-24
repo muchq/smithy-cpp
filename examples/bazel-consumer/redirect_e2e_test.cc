@@ -32,6 +32,8 @@ namespace {
 using acme::redirect::FetchInput;
 using acme::redirect::FetchOutput;
 using acme::redirect::NoSuchSlug;
+using acme::redirect::ProbeInput;
+using acme::redirect::ProbeOutput;
 using acme::redirect::RedirectorClient;
 using acme::redirect::RedirectorHandler;
 using acme::redirect::RedirectorServer;
@@ -91,6 +93,16 @@ class SlugHandler final : public RedirectorHandler {
     return FetchOutput{.status = fresh ? kNotModified : kOk,
                        .etag = kEtag,
                        .content = smithy::Blob::FromString(kContent)};
+  }
+
+  // Not exercised here — HEAD framing is head_e2e_test.cc's subject. Answers
+  // the same resource Fetch does, so the two files cannot drift on what /c
+  // serves.
+  smithy::Outcome<ProbeOutput> Probe(const ProbeInput& input,
+                                     const smithy::server::RequestContext&) override {
+    auto target = Lookup(input.slug);
+    if (!target) return std::move(target).error();
+    return ProbeOutput{.etag = kEtag, .content = smithy::Blob::FromString(kContent)};
   }
 
  private:

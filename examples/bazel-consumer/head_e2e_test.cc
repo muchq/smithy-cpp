@@ -45,8 +45,13 @@ using acme::redirect::ResolveOutput;
 
 constexpr char kEtag[] = "\"v1\"";
 constexpr char kContent[] = "hello from the origin";
-constexpr int kContentLength = 21;  // sizeof(kContent) - 1, spelled out so the
-                                    // wire assertion below is a literal
+
+// The framing the wire must show, derived from the payload rather than
+// written out twice: the point of the test is that HEAD and GET report the
+// same number, so nothing here may drift from what the handler serves.
+std::string ExpectedContentLength() {
+  return "content-length: " + std::to_string(std::string(kContent).size());
+}
 
 // Answers Probe exactly as it answers Fetch: same resource, same payload. A
 // handler cannot see the method, and this one does not try — clearing the
@@ -139,10 +144,10 @@ TEST(HeadE2ETest, AModeledHeadCarriesTheGetsLengthAndNoBody) {
   // The GET first: the length asserted below means nothing unless this is the
   // resource that actually comes back.
   EXPECT_EQ(BodyOf(get), kContent) << get;
-  EXPECT_NE(HeadersOf(get).find("content-length: 21"), std::string::npos) << get;
+  EXPECT_NE(HeadersOf(get).find(ExpectedContentLength()), std::string::npos) << get;
 
   EXPECT_EQ(BodyOf(head), "") << "HEAD answered with a body: " << head;
-  EXPECT_NE(HeadersOf(head).find("content-length: 21"), std::string::npos)
+  EXPECT_NE(HeadersOf(head).find(ExpectedContentLength()), std::string::npos)
       << "HEAD did not report the GET's length: " << head;
   // The rest of the header set survives — a HEAD answers "what would I get",
   // so the validator has to come with it.

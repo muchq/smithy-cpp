@@ -1217,5 +1217,30 @@ TEST(BeastTransportTest, StopIsIdempotentAndRestartable) {
   server.Stop();
 }
 
+// Both structs are described to callers as having optional fields — a
+// rejection whose request never parsed has no method or target, and a
+// connection event whose socket is gone has no peer address. Saying that by
+// omission has to compile.
+//
+// This is a compile-time assertion wearing a test's clothes: under
+// --config=werror, dropping the `= {}` from either struct makes these
+// designated initializers a -Wmissing-designated-field-initializers error and
+// the target fails to build (issue #193). The runtime EXPECTs are here so the
+// test also states what the omitted fields are worth.
+TEST(BeastTransportTest, OptionalFieldsCanBeOmittedFromDesignatedInitializers) {
+  const BeastServerTransport::RejectedRequest rejected{.status = 431};
+  EXPECT_EQ(rejected.status, 431);
+  EXPECT_TRUE(rejected.peer_address.empty());
+  EXPECT_TRUE(rejected.method.empty());
+  EXPECT_TRUE(rejected.target.empty());
+
+  const BeastServerTransport::ConnectionEvent event{
+      .kind = BeastServerTransport::ConnectionEvent::Kind::kFramingError};
+  EXPECT_EQ(event.kind, BeastServerTransport::ConnectionEvent::Kind::kFramingError);
+  EXPECT_TRUE(event.peer_address.empty());
+  EXPECT_TRUE(event.detail.empty());
+  EXPECT_EQ(event.elapsed, std::chrono::microseconds{0});
+}
+
 }  // namespace
 }  // namespace smithy::http

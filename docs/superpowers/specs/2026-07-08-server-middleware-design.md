@@ -51,6 +51,14 @@ Middleware HealthEndpoint(std::string path = "/health");
   application/json`, body `{"status":"healthy"}` (body omitted for HEAD, so
   transports never emit a mismatched content-length — added in PR review).
   Match is exact on the path portion of `target` (query string ignored).
+
+  > **Superseded (#192):** the HEAD carve-out above was backwards. Omitting the
+  > body in the handler does not avoid a mismatched content-length, it *is* one
+  > — the transport sizes the response from the body it is handed, so `HEAD
+  > /livez` answered `Content-Length: 0` where the GET answered 20. Framing is
+  > the transport's: it now withholds the octets and keeps the length
+  > (RFC 9110 §9.3.2), and the handler returns the same body either way.
+
 - Requests to the path with any other method pass through to `next` (the
   router 404/405s them, or serves them if the model defines such a route).
   Any other target passes through untouched.

@@ -1265,11 +1265,6 @@ TEST(BeastTransportTest, HeadResponsesCarryTheGetsLengthAndNoBody) {
   server.Stop();
 }
 
-// The failure a stray HEAD body actually causes. Sequential on one
-// connection, the way StripsHandlerSetFramingHeaders checks the same
-// property: read the HEAD response to its end, then ask for something else
-// on the same socket. Any body the HEAD emitted is still queued, so it
-// arrives where the second response should begin.
 TEST(BeastTransportTest, TheHealthEndpointsHeadReportsTheGetsLength) {
   // HealthEndpoint answers HEAD itself rather than routing it, so it is the
   // one shipped handler that can get the HEAD shape wrong on its own. Framing
@@ -1310,6 +1305,11 @@ TEST(BeastTransportTest, TheHealthEndpointsHeadReportsTheGetsLength) {
   server.Stop();
 }
 
+// The failure a stray HEAD body actually causes. Sequential on one
+// connection, the way StripsHandlerSetFramingHeaders checks the same
+// property: read the HEAD response to its end, then ask for something else
+// on the same socket. Any body the HEAD emitted is still queued, so it
+// arrives where the second response should begin.
 TEST(BeastTransportTest, AHeadLeavesTheConnectionInSync) {
   BeastServerTransport server;
   ASSERT_TRUE(server

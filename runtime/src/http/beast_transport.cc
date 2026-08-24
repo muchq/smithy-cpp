@@ -2040,6 +2040,11 @@ struct BeastHttpClient::State {
     beast::flat_buffer buffer;
     bhttp::response_parser<bhttp::string_body> parser;
     parser.body_limit(boost::none);  // Clients accept responses of any size.
+    // A HEAD response carries the Content-Length the equivalent GET would
+    // and no octets (RFC 9110 §9.3.2), so the parser has to be told the
+    // message ends at the headers. Without this it waits for a body that is
+    // required not to arrive, and the request only ends at the timeout.
+    parser.skip(wire.method_string() == "HEAD");
     connection.lowest().expires_after(Timeout());
     beast::error_code read_ec;
     auto read_handler = [&read_ec](beast::error_code ec, std::size_t) { read_ec = ec; };

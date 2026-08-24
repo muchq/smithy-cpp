@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "smithy/http/socket_transport.h"
+#include "smithy/server/middleware.h"
 #include "smithy/testing/connection_event_recorder.h"
 
 namespace smithy::http {
@@ -1269,6 +1270,46 @@ TEST(BeastTransportTest, HeadResponsesCarryTheGetsLengthAndNoBody) {
 // property: read the HEAD response to its end, then ask for something else
 // on the same socket. Any body the HEAD emitted is still queued, so it
 // arrives where the second response should begin.
+TEST(BeastTransportTest, TheHealthEndpointsHeadReportsTheGetsLength) {
+  // HealthEndpoint answers HEAD itself rather than routing it, so it is the
+  // one shipped handler that can get the HEAD shape wrong on its own. Framing
+  // belongs to the transport: a handler that empties the body to "omit" it
+  // has not omitted anything, it has changed the length to 0 — a false answer
+  // to the only question a HEAD asks.
+  BeastServerTransport server;
+  ASSERT_TRUE(server
+                  .Start(smithy::server::Chain({smithy::server::HealthEndpoint("/livez")},
+                                               [](const HttpRequest&) {
+                                                 HttpResponse response;
+                                                 response.status = 404;
+                                                 response.body = "no route";
+                                                 return response;
+                                               }))
+                  .ok());
+
+  const std::string head =
+      RawRoundTrip(server.port(), "HEAD /livez HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n");
+  const std::string get =
+      RawRoundTrip(server.port(), "GET /livez HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n");
+  ASSERT_FALSE(head.empty());
+  ASSERT_FALSE(get.empty());
+
+  const auto head_end = head.find("\r\n\r\n");
+  const auto get_end = get.find("\r\n\r\n");
+  ASSERT_NE(head_end, std::string::npos) << head;
+  ASSERT_NE(get_end, std::string::npos) << get;
+
+  EXPECT_EQ(get.substr(get_end + 4), R"({"status":"healthy"})") << get;
+  EXPECT_EQ(head.substr(head_end + 4), "") << "HEAD answered with a body: " << head;
+
+  const std::string head_headers = AsciiLowerCopy(head.substr(0, head_end));
+  EXPECT_NE(head_headers.find("content-length: 20"), std::string::npos)
+      << "HEAD did not report the GET's length: " << head;
+  EXPECT_NE(head_headers.find("content-type: application/json"), std::string::npos) << head;
+
+  server.Stop();
+}
+
 TEST(BeastTransportTest, AHeadLeavesTheConnectionInSync) {
   BeastServerTransport server;
   ASSERT_TRUE(server

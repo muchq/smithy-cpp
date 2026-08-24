@@ -140,10 +140,12 @@ Middleware HealthEndpoint(std::string path, std::vector<ReadinessCheck> checks) 
         http::HttpResponse response;
         response.status = failing.empty() ? 200 : 503;
         response.headers.Set("content-type", "application/json");
-        if (request.method == "GET") {
-          response.body = failing.empty() ? R"({"status":"healthy"})"
-                                          : R"({"status":"unhealthy","failing":[)" + failing + "]}";
-        }
+        // Set for HEAD too. Framing is the transport's, which withholds the
+        // octets and keeps the length (RFC 9110 §9.3.2); emptying the body
+        // here would answer Content-Length: 0 instead — a false claim about
+        // the resource, and the only question a HEAD asks.
+        response.body = failing.empty() ? R"({"status":"healthy"})"
+                                        : R"({"status":"unhealthy","failing":[)" + failing + "]}";
         return response;
       }
       return next(request);

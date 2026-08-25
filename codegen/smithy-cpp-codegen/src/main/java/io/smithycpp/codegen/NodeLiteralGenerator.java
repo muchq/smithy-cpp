@@ -190,10 +190,10 @@ final class NodeLiteralGenerator {
   private String minimalExpression(Shape shape, MemberShape member) {
     return switch (shape.getType()) {
       case BOOLEAN -> "false";
-      case BYTE, SHORT, INTEGER, LONG, FLOAT, DOUBLE, INT_ENUM ->
-          minimalNumberExpression(shape, member);
+      case BYTE, SHORT, INTEGER, LONG, FLOAT, DOUBLE -> minimalNumberExpression(shape, member);
       case STRING -> minimalStringExpression(shape, member);
       case ENUM -> minimalEnumExpression(shape);
+      case INT_ENUM -> minimalIntEnumExpression(shape);
       case BLOB -> "smithy::Blob()";
       case TIMESTAMP -> "smithy::Timestamp::FromEpochMilliseconds(0)";
       case DOCUMENT -> "smithy::Document(smithy::DocumentMap{})";
@@ -226,7 +226,6 @@ final class NodeLiteralGenerator {
             .orElse(java.math.BigDecimal.ZERO);
     String plain = value.stripTrailingZeros().toPlainString();
     return switch (shape.getType()) {
-      case INT_ENUM -> "static_cast<" + typeName(shape) + ">(" + plain + ")";
       case LONG -> plain + "LL";
       case FLOAT -> (plain.contains(".") ? plain : plain + ".0") + "F";
       case DOUBLE -> plain.contains(".") ? plain : plain + ".0";
@@ -270,6 +269,14 @@ final class NodeLiteralGenerator {
   private String minimalEnumExpression(Shape shape) {
     String first = shape.asEnumShape().orElseThrow().getEnumValues().values().iterator().next();
     return typeName(shape) + "::FromString(" + CppLiterals.stringLiteral(first) + ")";
+  }
+
+  private String minimalIntEnumExpression(Shape shape) {
+    // The first modeled member, not 0: a default-constructed intEnum is only
+    // valid when 0 happens to be in the value set, and servers validate
+    // membership (issue #109).
+    Integer first = shape.asIntEnumShape().orElseThrow().getEnumValues().values().iterator().next();
+    return "static_cast<" + typeName(shape) + ">(" + first + ")";
   }
 
   private String minimalStructureExpression(StructureShape shape) {
@@ -320,7 +327,9 @@ final class NodeLiteralGenerator {
     }
     boolean constrainedDefault =
         switch (shape.getType()) {
-          case ENUM -> true;
+          // intEnum joins enum: the default-constructed value (0 / unknown)
+          // fails server-side membership validation (issue #109).
+          case ENUM, INT_ENUM -> true;
           case STRING ->
               effective(shape, member, software.amazon.smithy.model.traits.LengthTrait.class)
                       .flatMap(software.amazon.smithy.model.traits.LengthTrait::getMin)

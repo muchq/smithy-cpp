@@ -92,6 +92,12 @@ void ValidateDefaults(const types::Defaults& value, const std::string& path, std
       helpers::AddValidationFailure(failures, member_path, "Value at '" + member_path + "' failed to satisfy constraint: Member must satisfy enum value set: [FOO, BAR, BAZ]");
     }
   }
+  {
+    const std::string member_path = path + "/defaultIntEnum";
+    if (value.defaultIntEnum != TestIntEnum::kOne && value.defaultIntEnum != TestIntEnum::kTwo) {
+      helpers::AddValidationFailure(failures, member_path, "Value at '" + member_path + "' failed to satisfy constraint: Member must satisfy enum value set: [1, 2]");
+    }
+  }
 }
 
 void ValidateDenseSetMap(const std::map<std::string, std::vector<std::string>>& value, const std::string& path, std::vector<smithy::server::ValidationFailure>* failures) {
@@ -134,6 +140,15 @@ void ValidateFooEnumList(const std::vector<FooEnum>& value, const std::string& p
   }
 }
 
+void ValidateIntegerEnumList(const std::vector<IntegerEnum>& value, const std::string& path, std::vector<smithy::server::ValidationFailure>* failures) {
+  for (std::size_t i = 0; i < value.size(); ++i) {
+    const std::string item_path = path + "/" + std::to_string(i);
+    if (value[i] != IntegerEnum::kA && value[i] != IntegerEnum::kB && value[i] != IntegerEnum::kC) {
+      helpers::AddValidationFailure(failures, item_path, "Value at '" + item_path + "' failed to satisfy constraint: Member must satisfy enum value set: [1, 2, 3]");
+    }
+  }
+}
+
 void ValidateRpcV2CborListsInput(const types::RpcV2CborListsInput& value, const std::string& path, std::vector<smithy::server::ValidationFailure>* failures) {
   if (value.stringSet.has_value()) {
     const std::string member_path = path + "/stringSet";
@@ -152,6 +167,10 @@ void ValidateRpcV2CborListsInput(const types::RpcV2CborListsInput& value, const 
   if (value.enumList.has_value()) {
     const std::string member_path = path + "/enumList";
     helpers::ValidateFooEnumList((*value.enumList), member_path, failures);
+  }
+  if (value.intEnumList.has_value()) {
+    const std::string member_path = path + "/intEnumList";
+    helpers::ValidateIntegerEnumList((*value.intEnumList), member_path, failures);
   }
 }
 

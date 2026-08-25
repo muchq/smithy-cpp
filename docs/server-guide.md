@@ -495,7 +495,8 @@ way the chat example's e2e tests do.
 
 Inputs are validated against the model's constraint traits after parsing and before your
 handler runs: `@required` (top-level body/query/header members), `@length` (strings count
-Unicode code points), `@range`, `@pattern`, `@uniqueItems`, and enum membership, recursively
+Unicode code points), `@range`, `@pattern`, `@uniqueItems`, and enum membership (string enums
+and intEnums alike), recursively
 through structures, unions, lists, and maps. Failures never reach the handler — the server
 responds with the standard 400 `ValidationException` wire shape (`message` summary plus a
 `fieldList` of per-member `{path, message}` entries, JSON-pointer paths like `/list/0`), with

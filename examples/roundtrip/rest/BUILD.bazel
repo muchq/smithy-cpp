@@ -15,6 +15,26 @@ cc_test(
     ],
 )
 
+# Issue #109 narrowing fixes, pinned across the module boundary in both
+# directions: intEnum int32 bounds + membership validation, float overflow
+# rejection, and the deliberate client/server asymmetry for unknown values.
+cc_test(
+    name = "numeric_bounds_wire_test",
+    size = "small",
+    srcs = ["numeric_bounds_wire_test.cc"],
+    copts = SMITHY_COPTS,
+    deps = [
+        "//examples/roundtrip/rest/generated:client",
+        "//examples/roundtrip/rest/generated:serde",
+        "//examples/roundtrip/rest/generated:server",
+        "//runtime:client",
+        "//runtime:core",
+        "//runtime:http",
+        "//runtime:json",
+        "@googletest//:gtest_main",
+    ],
+)
+
 cc_test(
     name = "api_key_wire_test",
     size = "small",

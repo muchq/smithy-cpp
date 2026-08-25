@@ -164,7 +164,9 @@ smithy::Outcome<GetBookOutput> DeserializeGetBookOutput(const smithy::Document& 
       {
         auto parsed = smithy::DoubleFromDocument(*member);
         if (!parsed) return smithy::Error::Serialization("GetBookOutput.price: expected a number");
-        parsed_member = static_cast<float>(*parsed);
+        auto narrowed = smithy::FloatFromDouble(*parsed);
+        if (!narrowed) return smithy::Error::Serialization("GetBookOutput.price: value out of range");
+        parsed_member = *narrowed;
       }
       out.price = std::move(parsed_member);
     }

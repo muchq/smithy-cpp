@@ -242,7 +242,9 @@ smithy::Outcome<DairyMilk> DeserializeDairyMilk(const smithy::Document& doc) {
     {
       auto parsed = smithy::DoubleFromDocument(*member);
       if (!parsed) return smithy::Error::Serialization("DairyMilk.percentFat: expected a number");
-      out.percentFat = static_cast<float>(*parsed);
+      auto narrowed = smithy::FloatFromDouble(*parsed);
+      if (!narrowed) return smithy::Error::Serialization("DairyMilk.percentFat: value out of range");
+      out.percentFat = *narrowed;
     }
   }
   return out;

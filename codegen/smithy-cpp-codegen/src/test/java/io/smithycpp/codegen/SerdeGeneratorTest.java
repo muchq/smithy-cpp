@@ -78,6 +78,43 @@ class SerdeGeneratorTest {
   }
 
   @Test
+  void narrowedNumericsRejectOutOfRangeWireValuesInsteadOfTruncating() {
+    // intEnum shares the int32 bounds check with Integer members (its
+    // underlying type is int32 — an unchecked cast would alias 2^32+2 onto a
+    // valid enumerator), and float rejects finite doubles beyond float range
+    // (the raw cast is UB; UBSan float-cast-overflow). Double stays
+    // uncheckable by construction. Issue #109.
+    String serde =
+        generateSerde(
+            """
+            $version: "2.0"
+            namespace test.serde
+
+            service Svc { version: "1", operations: [Op] }
+            operation Op { input := { payload: Payload } }
+
+            structure Payload {
+                weight: Weight
+                ratio: Float
+                precise: Double
+            }
+
+            intEnum Weight {
+                LIGHT = 1
+                HEAVY = 2
+            }
+            """);
+    int intEnumCheck = serde.indexOf("Payload.weight: value out of range");
+    int intEnumCast = serde.indexOf("static_cast<types::Weight>(member->as_int())");
+    assertTrue(intEnumCheck >= 0, serde);
+    assertTrue(intEnumCast >= 0, serde);
+    assertTrue(intEnumCheck < intEnumCast, "range check must precede the narrowing cast");
+    assertTrue(serde.contains("smithy::FloatFromDouble"), serde);
+    assertTrue(serde.contains("Payload.ratio: value out of range"), serde);
+    assertFalse(serde.contains("Payload.precise: value out of range"), serde);
+  }
+
+  @Test
   void timestampFormatTraitOverridesTheProtocolDefault() {
     String serde = generateSerde(KITCHEN_MODEL);
     assertTrue(serde.contains("smithy::TimestampFormat::kHttpDate"), serde);

@@ -134,6 +134,44 @@ class HttpJsonBindingProtocolTest {
   }
 
   @Test
+  void floatTextBindingsNarrowThroughTheCheckedHelper() {
+    // No checked-in fixture binds a float to a text position, so the golden
+    // trees can't pin this: a finite query/label/header value beyond float
+    // range must fail the parse via smithy::FloatFromDouble instead of
+    // hitting the UB static_cast (issue #109). Doubles stay unnarrowed.
+    String server =
+        PluginTestHarness.generate(
+                """
+                $version: "2.0"
+                namespace test.rest
+
+                use alloy#simpleRestJson
+
+                @simpleRestJson
+                service Nums { version: "1", operations: [GetStats] }
+
+                @http(method: "GET", uri: "/stats")
+                operation GetStats {
+                    input := {
+                        @httpQuery("ratio")
+                        ratio: Float
+
+                        @httpQuery("precise")
+                        precise: Double
+                    }
+                    output := { info: String }
+                }
+                """,
+                "test.rest#Nums",
+                "test::rest")
+            .expectFileString("/src/server.cc");
+    assertTrue(server.contains("smithy::FloatFromDouble(*parsed_num)"), server);
+    assertTrue(
+        server.contains("if (!narrowed_num) return std::move(narrowed_num).error();"), server);
+    assertEquals(1, count(server, "FloatFromDouble"), server);
+  }
+
+  @Test
   void serverRoutesCarryContentNegotiationAndErrorIdentity() {
     String server = generateFiles().expectFileString("/src/server.cc");
     assertEquals(2, count(server, "router_->Add("), server);

@@ -317,7 +317,9 @@ smithy::Outcome<KitchenSink> DeserializeKitchenSink(const smithy::Document& doc)
       {
         auto parsed = smithy::DoubleFromDocument(*member);
         if (!parsed) return smithy::Error::Serialization("KitchenSink.ratio: expected a number");
-        parsed_member = static_cast<float>(*parsed);
+        auto narrowed = smithy::FloatFromDouble(*parsed);
+        if (!narrowed) return smithy::Error::Serialization("KitchenSink.ratio: value out of range");
+        parsed_member = *narrowed;
       }
       out.ratio = std::move(parsed_member);
     }
@@ -360,6 +362,7 @@ smithy::Outcome<KitchenSink> DeserializeKitchenSink(const smithy::Document& doc)
     if (member != nullptr && !member->is_null()) {
       types::Weight parsed_member{};
       if (!member->is_int()) return smithy::Error::Serialization("KitchenSink.weight: unexpected type on the wire");
+      if (member->as_int() < -2147483648LL || member->as_int() > 2147483647LL) return smithy::Error::Serialization("KitchenSink.weight: value out of range");
       parsed_member = static_cast<types::Weight>(member->as_int());
       out.weight = std::move(parsed_member);
     }

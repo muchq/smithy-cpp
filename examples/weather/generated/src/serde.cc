@@ -97,7 +97,9 @@ smithy::Outcome<GetForecastOutput> DeserializeGetForecastOutput(const smithy::Do
       {
         auto parsed = smithy::DoubleFromDocument(*member);
         if (!parsed) return smithy::Error::Serialization("GetForecastOutput.chanceOfRain: expected a number");
-        parsed_member = static_cast<float>(*parsed);
+        auto narrowed = smithy::FloatFromDouble(*parsed);
+        if (!narrowed) return smithy::Error::Serialization("GetForecastOutput.chanceOfRain: value out of range");
+        parsed_member = *narrowed;
       }
       out.chanceOfRain = std::move(parsed_member);
     }
@@ -143,7 +145,9 @@ smithy::Outcome<CityCoordinates> DeserializeCityCoordinates(const smithy::Docume
     {
       auto parsed = smithy::DoubleFromDocument(*member);
       if (!parsed) return smithy::Error::Serialization("CityCoordinates.latitude: expected a number");
-      out.latitude = static_cast<float>(*parsed);
+      auto narrowed = smithy::FloatFromDouble(*parsed);
+      if (!narrowed) return smithy::Error::Serialization("CityCoordinates.latitude: value out of range");
+      out.latitude = *narrowed;
     }
   }
   {
@@ -154,7 +158,9 @@ smithy::Outcome<CityCoordinates> DeserializeCityCoordinates(const smithy::Docume
     {
       auto parsed = smithy::DoubleFromDocument(*member);
       if (!parsed) return smithy::Error::Serialization("CityCoordinates.longitude: expected a number");
-      out.longitude = static_cast<float>(*parsed);
+      auto narrowed = smithy::FloatFromDouble(*parsed);
+      if (!narrowed) return smithy::Error::Serialization("CityCoordinates.longitude: value out of range");
+      out.longitude = *narrowed;
     }
   }
   return out;

@@ -73,11 +73,13 @@ template <typename T>
 class Mailbox {
  public:
   void Post(T value) {
-    {
-      const std::lock_guard<std::mutex> lock(mutex_);
-      ASSERT_FALSE(value_.has_value()) << "completion fired twice";
-      value_.emplace(std::move(value));
-    }
+    // Notify under the lock, not after it (ContractMailbox's rule): a
+    // poster on a foreign thread — a deadline watchdog, a peer completion —
+    // otherwise races the waiter's return and ~Mailbox runs while the
+    // poster is still inside notify_all.
+    const std::lock_guard<std::mutex> lock(mutex_);
+    ASSERT_FALSE(value_.has_value()) << "completion fired twice";
+    value_.emplace(std::move(value));
     ready_.notify_all();
   }
 

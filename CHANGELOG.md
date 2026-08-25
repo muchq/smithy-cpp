@@ -8,6 +8,18 @@ policy in [docs/versioning.md](docs/versioning.md).
 
 ### Fixed
 
+- **Numeric wire values no longer truncate into generated narrow types**
+  (#109). Three holes in the otherwise-uniform range-check posture: an
+  `intEnum` member cast the raw wire int64 straight into its `int32`-backed
+  `enum class`, so 2^32+2 silently aliased onto a valid enumerator (byte /
+  short / integer members already rejected out-of-range values — intEnum now
+  shares their check, on document bodies and text bindings alike); a `float`
+  member cast the parsed double unchecked, so a finite wire value beyond
+  float range (`1e300`) was undefined behavior per [conv.double] — the new
+  `smithy::FloatFromDouble` rejects it while NaN/±Infinity still pass; and
+  the jsonRpc2 client truncated `error.code` to `int` *before* its 100–599
+  range test, classifying 2^32+404 as HTTP 404 (with 5xx codes wrongly
+  marked retryable) — codes are now classified on the full int64.
 - **Modeled redirects: a 3xx `@httpResponseCode` is a success, not an error**
   (#184). Generated clients tested `status < 200 || status > 299` when the
   output bound `@httpResponseCode`, so every modeled redirect came back as a
@@ -31,6 +43,15 @@ policy in [docs/versioning.md](docs/versioning.md).
 
 ### Added
 
+- **Servers validate intEnum membership** (#109). String enums already
+  failed request validation outside the modeled value set; intEnum members
+  were accepted silently. They now produce the same suite-exact
+  `ValidationException` message
+  (`Member must satisfy enum value set: [1, 2]`), with `@internal` members
+  staying wire-valid but unadvertised — string-enum policy throughout.
+  Clients deliberately keep
+  unknown-but-in-range values for forward compatibility, and the asymmetry is
+  pinned by `examples/roundtrip/rest/numeric_bounds_wire_test.cc`.
 - **Redirects are documented and covered** — a "Redirects (3xx)" section in
   [docs/server-guide.md](docs/server-guide.md) covering both spellings and the
   `@suppress(["HttpResponseCodeSemantics"])` a static non-2xx `@http` code

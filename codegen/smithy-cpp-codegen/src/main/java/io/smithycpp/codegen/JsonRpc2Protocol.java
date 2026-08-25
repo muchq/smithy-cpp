@@ -110,9 +110,11 @@ final class JsonRpc2Protocol implements ProtocolGenerator {
     w.openBlock(
         "if (const smithy::Document* code = error->Find(\"code\"); "
             + "code != nullptr && code->is_int()) {");
-    w.write("const auto rpc_code = static_cast<int>(code->as_int());");
+    // Classified on the full int64: narrowing first would alias 2^32+404
+    // onto 404 and misroute status/retryability (issue #109).
+    w.write("const std::int64_t rpc_code = code->as_int();");
     w.write(
-        "parsed.status = rpc_code >= 100 && rpc_code < 600 ? rpc_code "
+        "parsed.status = rpc_code >= 100 && rpc_code < 600 ? static_cast<int>(rpc_code) "
             + ": (rpc_code == -32603 ? 500 : 400);");
     w.closeBlock("}");
     w.write(

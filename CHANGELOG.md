@@ -10,13 +10,15 @@ policy in [docs/versioning.md](docs/versioning.md).
 
 - **Numeric wire values no longer truncate into generated narrow types**
   (#109). Three holes in the otherwise-uniform range-check posture: an
-  `intEnum` member cast the raw wire int64 straight into its `int32`-backed
-  `enum class`, so 2^32+2 silently aliased onto a valid enumerator (byte /
-  short / integer members already rejected out-of-range values — intEnum now
-  shares their check, on document bodies and text bindings alike); a `float`
-  member cast the parsed double unchecked, so a finite wire value beyond
-  float range (`1e300`) was undefined behavior per [conv.double] — the new
-  `smithy::FloatFromDouble` rejects it while NaN/±Infinity still pass; and
+  `intEnum` member in a document body cast the raw wire int64 straight into
+  its `int32`-backed `enum class`, so 2^32+2 silently aliased onto a valid
+  enumerator (byte / short / integer members already rejected out-of-range
+  values, and intEnum *text* bindings were already bounded — the body path
+  now shares the same check); a `float` member cast the parsed double
+  unchecked on both the body and text-binding paths, so a finite wire value
+  beyond float range (`1e300`) was undefined behavior per [conv.double] —
+  the new `smithy::FloatFromDouble` rejects it while NaN/±Infinity still
+  pass; and
   the jsonRpc2 client truncated `error.code` to `int` *before* its 100–599
   range test, classifying 2^32+404 as HTTP 404 (with 5xx codes wrongly
   marked retryable) — codes are now classified on the full int64.

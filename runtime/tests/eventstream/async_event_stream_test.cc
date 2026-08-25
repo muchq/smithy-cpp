@@ -133,6 +133,81 @@ TEST(PairAsyncTest, AReadyMessageCompletesImmediately) {
   EXPECT_EQ((*outcome)->payload.ToString(), "1");
 }
 
+// The #130 deadline over the pair: what the transport-neutral contract
+// suite cannot pin because its driver has no "peer sends" hook.
+
+TEST(PairAsyncTest, ATimedReceiveDeliversAMessageThatBeatsTheDeadline) {
+  auto [a, b] = http::InMemoryWebSocketPair::Create();
+  Mailbox<Outcome<std::optional<Message>>> received;
+  a->ReceiveAsync(std::chrono::seconds(30), [&](Outcome<std::optional<Message>> message) {
+    received.Post(std::move(message));
+  });
+  EXPECT_TRUE(received.Empty());  // parked: nothing sent yet
+
+  ASSERT_TRUE(b->Send(RawPing(7)).ok());
+  auto outcome = received.Wait();
+  ASSERT_TRUE(outcome.ok() && outcome->has_value());
+  EXPECT_EQ((*outcome)->payload.ToString(), "7");
+}
+
+TEST(PairAsyncTest, ATimedReceiveTimesOutAndALaterMessageWaitsForTheNextReceive) {
+  auto [a, b] = http::InMemoryWebSocketPair::Create();
+  Mailbox<Outcome<std::optional<Message>>> timed;
+  a->ReceiveAsync(std::chrono::milliseconds(50),
+                  [&](Outcome<std::optional<Message>> message) { timed.Post(std::move(message)); });
+  auto expired = timed.Wait();
+  ASSERT_FALSE(expired.ok());
+  EXPECT_EQ(expired.error().code(), "TimeoutError");
+
+  // Nothing was lost to the deadline: the message the peer sends after it
+  // waits in the session for whoever receives next.
+  ASSERT_TRUE(b->Send(RawPing(9)).ok());
+  Mailbox<Outcome<std::optional<Message>>> next;
+  a->ReceiveAsync([&](Outcome<std::optional<Message>> message) { next.Post(std::move(message)); });
+  auto outcome = next.Wait();
+  ASSERT_TRUE(outcome.ok() && outcome->has_value());
+  EXPECT_EQ((*outcome)->payload.ToString(), "9");
+}
+
+TEST(PairAsyncTest, AStaleDeadlineNeverFiresALaterReceive) {
+  auto [a, b] = http::InMemoryWebSocketPair::Create();
+  // Park with a short deadline and complete it by delivery well inside it.
+  Mailbox<Outcome<std::optional<Message>>> first;
+  a->ReceiveAsync(std::chrono::milliseconds(200),
+                  [&](Outcome<std::optional<Message>> message) { first.Post(std::move(message)); });
+  ASSERT_TRUE(b->Send(RawPing(1)).ok());
+  ASSERT_TRUE(first.Wait().ok());
+
+  // A fresh (untimed) park now occupies the slot the expired deadline was
+  // armed for. The generation guard makes the stale watchdog a no-op: well
+  // past the original deadline, the new park is still waiting.
+  Mailbox<Outcome<std::optional<Message>>> second;
+  a->ReceiveAsync(
+      [&](Outcome<std::optional<Message>> message) { second.Post(std::move(message)); });
+  std::this_thread::sleep_for(std::chrono::milliseconds(400));
+  EXPECT_TRUE(second.Empty()) << "a stale deadline timed out a receive it never bounded";
+
+  ASSERT_TRUE(b->Send(RawPing(2)).ok());
+  auto outcome = second.Wait();
+  ASSERT_TRUE(outcome.ok() && outcome->has_value());
+  EXPECT_EQ((*outcome)->payload.ToString(), "2");
+}
+
+TEST(PairAsyncTest, AZeroTimeoutReceivePollsWhatIsAlreadyInHand) {
+  auto [a, b] = http::InMemoryWebSocketPair::Create();
+  ASSERT_TRUE(b->Send(RawPing(3)).ok());
+  Mailbox<Outcome<std::optional<Message>>> polled;
+  a->ReceiveAsync(std::chrono::milliseconds(0), [&](Outcome<std::optional<Message>> message) {
+    polled.Post(std::move(message));
+  });
+  // Inline: the pair has no executor, so the poll completed before the call
+  // returned — with the queued message, not a timeout.
+  ASSERT_FALSE(polled.Empty());
+  auto outcome = polled.Wait();
+  ASSERT_TRUE(outcome.ok() && outcome->has_value());
+  EXPECT_EQ((*outcome)->payload.ToString(), "3");
+}
+
 TEST(PairAsyncTest, ASecondOutstandingReceiveIsRefused) {
   auto [a, b] = http::InMemoryWebSocketPair::Create();
   Mailbox<Outcome<std::optional<Message>>> first;
@@ -356,6 +431,80 @@ TEST(AsyncEventStreamTest, ADetachedLoopEchoesAndEndsOnTheCleanClose) {
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
   EXPECT_TRUE(done.load());
+}
+
+// The #130 watchdog shape: a loop that bounds each await, treats the
+// timeout as "nothing yet" rather than an end, and keeps serving. The
+// deadline is not terminal — the same stream receives the ping that
+// arrives after a timeout and answers it.
+TEST(AsyncEventStreamTest, AwaitedReceiveTimesOutAndTheSessionStaysUsable) {
+  auto [client_socket, server_socket] = http::InMemoryWebSocketPair::Create();
+  std::atomic<int> timeouts{0};
+  std::atomic<bool> done{false};
+
+  [](std::shared_ptr<http::WebSocket> socket, std::atomic<int>* timeouts,
+     std::atomic<bool>* done) -> Detached {
+    AsyncServer stream(std::move(socket), EncodePong, DecodePing);
+    while (true) {
+      auto ping = co_await stream.Receive(std::chrono::milliseconds(50));
+      if (!ping.ok()) {
+        if (ping.error().code() == "TimeoutError") {
+          ++*timeouts;  // not terminal: the watchdog tick, then wait again
+          continue;
+        }
+        break;
+      }
+      if (!ping->has_value()) break;
+      auto sent = co_await stream.Send(Pong{"pong-" + std::to_string((*ping)->number)});
+      if (!sent.ok()) break;
+    }
+    *done = true;
+  }(server_socket, &timeouts, &done);
+
+  // Let at least one deadline expire before the first ping.
+  for (int i = 0; i < 100 && timeouts.load() == 0; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  EXPECT_GT(timeouts.load(), 0) << "the awaited deadline never fired";
+  EXPECT_FALSE(done.load()) << "a timeout must not end the loop";
+
+  EventStream<Ping, Pong> client(client_socket, EncodePing, DecodePong);
+  ASSERT_TRUE(client.Send(Ping{42}).ok());
+  auto pong = client.Receive();
+  ASSERT_TRUE(pong.ok() && pong->has_value());
+  EXPECT_EQ((*pong)->text, "pong-42");
+
+  client.Close();
+  for (int i = 0; i < 100 && !done.load(); ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  EXPECT_TRUE(done.load());
+}
+
+// The raw awaitable's deadline (#130): ReceiveMessage with a timeout — the
+// ADR-0023 launch-body shape, where a client that never sends its opening
+// envelope must not park the serve coroutine forever.
+TEST(AsyncEventStreamTest, ReceiveMessageHonorsItsDeadline) {
+  auto [client_socket, server_socket] = http::InMemoryWebSocketPair::Create();
+  Mailbox<Outcome<std::optional<Message>>> first;
+  Mailbox<Outcome<std::optional<Message>>> second;
+
+  [](std::shared_ptr<http::WebSocket> socket, Mailbox<Outcome<std::optional<Message>>>* first,
+     Mailbox<Outcome<std::optional<Message>>>* second) -> Detached {
+    first->Post(co_await ReceiveMessage(socket, std::chrono::milliseconds(50)));
+    // The timeout released the slot: the same socket awaits again and gets
+    // the envelope that arrives late.
+    second->Post(co_await ReceiveMessage(socket, std::chrono::seconds(30)));
+  }(server_socket, &first, &second);
+
+  auto expired = first.Wait();
+  ASSERT_FALSE(expired.ok());
+  EXPECT_EQ(expired.error().code(), "TimeoutError");
+
+  ASSERT_TRUE(client_socket->Send(RawPing(5)).ok());
+  auto arrived = second.Wait();
+  ASSERT_TRUE(arrived.ok() && arrived->has_value());
+  EXPECT_EQ((*arrived)->payload.ToString(), "5");
 }
 
 TEST(AsyncEventStreamTest, AwaitedSendBackpressuresWithoutAThread) {

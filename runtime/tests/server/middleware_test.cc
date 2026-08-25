@@ -551,7 +551,7 @@ TEST(HealthEndpointDeathTest, NameThatWouldCorruptTheJsonAbortsAtComposition) {
   EXPECT_NO_THROW(HealthEndpoint("/readyz", {{"db:primary/us-east 1", [] { return true; }}}));
 }
 
-TEST(HealthEndpointTest, ReadinessAnswersHeadWithStatusOnly) {
+TEST(HealthEndpointTest, ReadinessAnswersHeadWithTheStatusAndTheGetsBody) {
   auto handler = Chain({HealthEndpoint("/readyz", {{"db", [] { return false; }}})},
                        [](const http::HttpRequest&) { return Ok("router"); });
   http::HttpRequest request;
@@ -559,23 +559,32 @@ TEST(HealthEndpointTest, ReadinessAnswersHeadWithStatusOnly) {
   request.target = "/readyz";
   const auto response = handler(request);
   EXPECT_EQ(response.status, 503);
-  EXPECT_EQ(response.body, "");
+  EXPECT_EQ(response.body, R"({"status":"unhealthy","failing":["db"]})");
 }
 
-TEST(HealthEndpointTest, AnswersHeadWithoutABody) {
+TEST(HealthEndpointTest, AnswersHeadWithWhatTheGetWouldCarry) {
+  // The middleware does not strip the body for HEAD, because the length it
+  // reports is the answer a HEAD is asking for. The transport withholds the
+  // octets and keeps that length; a handler that emptied the body here would
+  // reduce it to Content-Length: 0. Pinned on the wire by
+  // BeastTransportTest.TheHealthEndpointsHeadReportsTheGetsLength.
   bool reached = false;
   auto handler = Chain({HealthEndpoint()}, [&](const http::HttpRequest&) {
     reached = true;
     return Ok("router");
   });
 
-  http::HttpRequest request;
-  request.method = "HEAD";
-  request.target = "/health";
-  const auto response = handler(request);
+  http::HttpRequest head;
+  head.method = "HEAD";
+  head.target = "/health";
+  http::HttpRequest get;
+  get.method = "GET";
+  get.target = "/health";
+  const auto response = handler(head);
   EXPECT_EQ(response.status, 200);
   EXPECT_EQ(response.headers.Get("content-type").value_or(""), "application/json");
-  EXPECT_EQ(response.body, "");
+  EXPECT_EQ(response.body, handler(get).body);
+  EXPECT_EQ(response.body, R"({"status":"healthy"})");
   EXPECT_FALSE(reached);
 }
 

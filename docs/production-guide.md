@@ -214,8 +214,9 @@ transport.Start(smithy::server::Chain(
            // gauge +1 (labeled by s.method/s.target; the operation is not
            // known until the router runs).
          }),
-     // Liveness: GET or HEAD /livez -> 200 {"status":"healthy"} (no body
-     // for HEAD); everything else passes through to the router.
+     // Liveness: GET or HEAD /livez -> 200 {"status":"healthy"}. A HEAD
+     // gets that body's Content-Length and none of its octets, framed by
+     // the transport; everything else passes through to the router.
      smithy::server::HealthEndpoint("/livez"),
      // Readiness: the same endpoint with checks. Every probe runs on every
      // request (no caching — a cached 200 would hide a dependency outage);

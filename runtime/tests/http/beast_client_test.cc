@@ -133,6 +133,48 @@ TEST(BeastClientTest, MintsDistinctTraceIdsAcrossKeepAliveRequests) {
   server.Stop();
 }
 
+TEST(BeastClientTest, HeadRoundTripsWithoutWaitingForTheBodyItsLengthAdvertises) {
+  // The client half of issue #192. The server now answers a HEAD with the
+  // GET's Content-Length and no octets, so a client that reads that header as
+  // a promise of bytes waits for a body no compliant peer will send — the
+  // request ends at request_timeout_ms, and the connection is left mid-message.
+  BeastServerTransport server({.port = 0, .threads = 1});
+  ASSERT_TRUE(server
+                  .Start([](const HttpRequest&) {
+                    HttpResponse response;
+                    response.status = 200;
+                    response.headers.Set("content-type", "application/json");
+                    response.body = R"({"id":"abc"})";
+                    return response;
+                  })
+                  .ok());
+
+  // Short, so a client that waits reports it here instead of stalling the
+  // suite for the 30s default.
+  BeastHttpClient client({.host = "127.0.0.1", .port = server.port(), .request_timeout_ms = 2000});
+
+  HttpRequest head;
+  head.method = "HEAD";
+  head.target = "/thing";
+  const auto response = client.Send(head);
+  ASSERT_TRUE(response.ok()) << response.error().message();
+  EXPECT_EQ(response->status, 200);
+  EXPECT_EQ(response->body, "");
+  EXPECT_EQ(response->headers.Get("content-length").value_or(""), "12");
+
+  // The connection goes back in the pool on keep-alive. A HEAD the client
+  // mis-framed would leave it out of sync, and this GET would read the tail
+  // of the previous message.
+  HttpRequest get;
+  get.method = "GET";
+  get.target = "/thing";
+  const auto pooled = client.Send(get);
+  ASSERT_TRUE(pooled.ok()) << pooled.error().message();
+  EXPECT_EQ(pooled->status, 200);
+  EXPECT_EQ(pooled->body, R"({"id":"abc"})");
+  server.Stop();
+}
+
 TEST(BeastClientTest, TlsRoundTripsWithCustomCa) {
   BeastServerTransport server(TlsServerOptions(/*threads=*/2));
   ASSERT_TRUE(server.Start(EchoHandler()).ok());

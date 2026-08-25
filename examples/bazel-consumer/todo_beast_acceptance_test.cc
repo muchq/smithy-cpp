@@ -107,6 +107,50 @@ TEST_F(TodoBeastAcceptanceTest, RoundTripsAndModeledErrorsWork) {
   ASSERT_NE(missing.error().detail<NoSuchTask>(), nullptr);
 }
 
+// The #109 numeric bounds, out of tree and over the real socket: hostile
+// wire values for the model's intEnum and float members are rejected by
+// the generated server before the handler runs, and the generated client
+// serializes valid ones — the same generator output consumers ship.
+TEST_F(TodoBeastAcceptanceTest, NumericBoundsAreEnforcedOverTheRealSocket) {
+  smithy::http::BeastHttpClient raw({.host = "127.0.0.1", .port = transport_->port()});
+  const auto post = [&raw](const std::string& body) {
+    smithy::http::HttpRequest request;
+    request.method = "POST";
+    request.target = "/tasks";
+    request.headers.Set("content-type", "application/json");
+    request.body = body;
+    return raw.Send(request);
+  };
+
+  // 2^32+2 would alias onto a valid Priority under a truncating cast; the
+  // parse rejects it instead.
+  auto aliased = post(R"({"title":"t","priority":4294967298})");
+  ASSERT_TRUE(aliased.ok()) << aliased.error().message();
+  EXPECT_EQ(aliased->status, 400);
+  EXPECT_EQ(aliased->headers.Get("x-error-type").value_or("<missing>"), "SerializationException");
+
+  // In range but outside the modeled set: membership validation, with the
+  // suite-exact message shape.
+  auto unknown = post(R"({"title":"t","priority":3})");
+  ASSERT_TRUE(unknown.ok()) << unknown.error().message();
+  EXPECT_EQ(unknown->status, 400);
+  EXPECT_EQ(unknown->headers.Get("x-error-type").value_or("<missing>"), "ValidationException");
+  EXPECT_NE(unknown->body.find("Member must satisfy enum value set: [1, 2]"), std::string::npos)
+      << unknown->body;
+
+  // A finite double beyond float range was UB to cast; it fails the parse.
+  auto overflow = post(R"({"title":"t","effortHours":1e300})");
+  ASSERT_TRUE(overflow.ok()) << overflow.error().message();
+  EXPECT_EQ(overflow->status, 400);
+  EXPECT_EQ(overflow->headers.Get("x-error-type").value_or("<missing>"), "SerializationException");
+
+  // Valid values ride the generated client end to end.
+  auto added = client_->AddTask(AddTaskInput{
+      .title = "well bounded", .priority = acme::todo::Priority::kHigh, .effortHours = 1.5F});
+  ASSERT_TRUE(added.ok()) << added.error().message();
+  EXPECT_EQ(added->title, "well bounded");
+}
+
 TEST_F(TodoBeastAcceptanceTest, LifecycleStopsAndRestartsAcrossTransportGenerations) {
   // The rolling-restart pattern from the production guide, composed entirely
   // from the consumer-visible API: serve, Stop() (bounded — the drain knob

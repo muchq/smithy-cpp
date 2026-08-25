@@ -22,6 +22,10 @@ operation AddTask {
         @required
         @length(min: 1, max: 256)
         title: String
+
+        priority: Priority
+
+        effortHours: Float
     }
 
     output := {
@@ -53,6 +57,14 @@ operation GetTask {
     }
 
     errors: [NoSuchTask]
+}
+
+/// int32 on the wire: out-of-range values fail the parse and unknown
+/// in-range values fail server validation (#109) — the members above give
+/// those checks out-of-tree, real-socket coverage.
+intEnum Priority {
+    LOW = 1
+    HIGH = 2
 }
 
 @error("client")

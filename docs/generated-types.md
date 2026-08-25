@@ -19,7 +19,7 @@ compatibility contract: changes to it are breaking for consumers of generated co
 | `structure` | `struct` with public members | Aggregate; `operator==` and `operator<=>` defaulted; every member value-initialized with `{}` |
 | `union` | class over `std::variant` | See below |
 | `enum` | class with nested `enum class Value` | See below; unknown wire values preserved |
-| `intEnum` | `enum class X : std::int32_t` | |
+| `intEnum` | `enum class X : std::int32_t` | Wire values outside int32 fail the parse; unknown in-range values are preserved (servers additionally validate membership) |
 | `smithy.api#Unit` | `smithy::Unit` | Never declared; maps to the runtime type |
 | `bigInteger` / `bigDecimal` | — | Rejected with a clear error (planned) |
 | `@streaming` blob member | trait ignored | Generates as a fully buffered `smithy::Blob`; see the README's [Current limitations](../README.md#current-limitations) |

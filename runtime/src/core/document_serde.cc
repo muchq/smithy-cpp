@@ -53,6 +53,21 @@ Outcome<double> DoubleFromDocument(const Document& doc) {
   return Error::Serialization("number: expected a number or NaN/Infinity/-Infinity");
 }
 
+Outcome<float> FloatFromDouble(double value) {
+  // Only finite values that overflow the cast are rejected: [conv.double]
+  // goes undefined once the round-to-nearest result falls outside float's
+  // range, which happens at 2^128·(1−2^−25) — NOT at FLT_MAX. The gap
+  // matters: shortest-round-trip float text (FormatFloat's own output for
+  // FLT_MAX, "3.4028235e+38") parses to a double slightly above FLT_MAX
+  // that still rounds back to it and must keep parsing. NaN and ±Infinity
+  // narrow losslessly and are legal Smithy float values on every wire.
+  constexpr double kFloatOverflowBound = 0x1.ffffffp+127;  // 2^128 - 2^103
+  if (std::isfinite(value) && (value <= -kFloatOverflowBound || value >= kFloatOverflowBound)) {
+    return Error::Serialization("number: value out of float range");
+  }
+  return static_cast<float>(value);
+}
+
 namespace {
 template <typename T>
 std::string FormatFloating(T value) {

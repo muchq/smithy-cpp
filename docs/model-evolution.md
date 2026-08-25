@@ -161,7 +161,7 @@ compiling) are separate questions:
 | Add optional member | ✅ old readers ignore it; absent → unset `std::optional` | ✅ additive |
 | Add member with `@default` | ✅ absent → the default | ✅ additive (plain member, default-initialized) |
 | Add operation | ✅ old clients never call it | ⚠️ handlers must implement the new pure-virtual method (compile error guides) |
-| Add enum value | ✅ old readers preserve unknown values (`Value::kUnknown` + original text) | ✅ additive |
+| Add enum value | ✅ old *clients* preserve unknown values (string enums: `Value::kUnknown` + original text; intEnums keep the in-range value) — ⚠️ old *servers* reject values outside their modeled set with 400 `ValidationException` | ✅ additive |
 | Promote optional → `@required` + `@default` | ✅ absence on the wire keeps the default (the generator's evolution leniency) | ✅ member becomes plain (non-optional) — call sites reading `.has_value()` need updating |
 | Promote optional → `@required` (no default) | ❌ old writers that omit it now fail deserialization | ❌ member type changes |
 | Rename member | ❌ wire key changes — unless the old wire name is kept via `@jsonName` | ❌ compile errors at every use |

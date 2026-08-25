@@ -43,6 +43,7 @@ GetEnumOutput MinimalGetEnumOutput() {
 GetIntEnumOutput MinimalGetIntEnumOutput() {
     return [] {
     GetIntEnumOutput v{};
+    v.result = static_cast<EnumResult>(1);
     return v;
   }();
 }
@@ -241,6 +242,7 @@ smithy::http::HttpRequest MinimalRequestForGetIntEnum() {
   auto client = *PizzaAdminServiceClient::Create(std::move(config));
     GetIntEnumInput input = [] {
     GetIntEnumInput v{};
+    v.aa = static_cast<EnumResult>(1);
     return v;
   }();
   (void)client.GetIntEnum(input);

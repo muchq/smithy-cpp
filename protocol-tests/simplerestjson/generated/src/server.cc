@@ -260,6 +260,15 @@ void ValidateGetEnumInput(const types::GetEnumInput& value, const std::string& p
   }
 }
 
+void ValidateGetIntEnumInput(const types::GetIntEnumInput& value, const std::string& path, std::vector<smithy::server::ValidationFailure>* failures) {
+  {
+    const std::string member_path = path + "/aa";
+    if (value.aa != EnumResult::kFirst && value.aa != EnumResult::kSecond) {
+      helpers::AddValidationFailure(failures, member_path, "Value at '" + member_path + "' failed to satisfy constraint: Member must satisfy enum value set: [1, 2]");
+    }
+  }
+}
+
 void ValidateHealthInput(const types::HealthInput& value, const std::string& path, std::vector<smithy::server::ValidationFailure>* failures) {
   if (value.query.has_value()) {
     const std::string member_path = path + "/query";
@@ -781,6 +790,8 @@ PizzaAdminServiceServer::PizzaAdminServiceServer(std::shared_ptr<PizzaAdminServi
     auto input = helpers::ParseGetIntEnumInput(request, context, &validation_failures);
     if (!validation_failures.empty()) return helpers::ValidationErrorResponse(validation_failures);
     if (!input) return helpers::ErrorToResponse(input.error());
+    helpers::ValidateGetIntEnumInput(*input, "", &validation_failures);
+    if (!validation_failures.empty()) return helpers::ValidationErrorResponse(validation_failures);
     auto outcome = handler->GetIntEnum(*input, context);
     if (!outcome) return helpers::ErrorToResponse(outcome.error());
     return helpers::BuildGetIntEnumResponse(*outcome);

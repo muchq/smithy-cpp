@@ -364,7 +364,9 @@ smithy::Outcome<Defaults> DeserializeDefaults(const smithy::Document& doc) {
       {
         auto parsed = smithy::DoubleFromDocument(*member);
         if (!parsed) return smithy::Error::Serialization("Defaults.defaultFloat: expected a number");
-        parsed_member = static_cast<float>(*parsed);
+        auto narrowed = smithy::FloatFromDouble(*parsed);
+        if (!narrowed) return smithy::Error::Serialization("Defaults.defaultFloat: value out of range");
+        parsed_member = *narrowed;
       }
       out.defaultFloat = std::move(parsed_member);
     }
@@ -407,6 +409,7 @@ smithy::Outcome<Defaults> DeserializeDefaults(const smithy::Document& doc) {
     if (member != nullptr && !member->is_null()) {
       types::TestIntEnum parsed_member{};
       if (!member->is_int()) return smithy::Error::Serialization("Defaults.defaultIntEnum: unexpected type on the wire");
+      if (member->as_int() < -2147483648LL || member->as_int() > 2147483647LL) return smithy::Error::Serialization("Defaults.defaultIntEnum: value out of range");
       parsed_member = static_cast<types::TestIntEnum>(member->as_int());
       out.defaultIntEnum = std::move(parsed_member);
     }
@@ -487,7 +490,9 @@ smithy::Outcome<Defaults> DeserializeDefaults(const smithy::Document& doc) {
       {
         auto parsed = smithy::DoubleFromDocument(*member);
         if (!parsed) return smithy::Error::Serialization("Defaults.zeroFloat: expected a number");
-        parsed_member = static_cast<float>(*parsed);
+        auto narrowed = smithy::FloatFromDouble(*parsed);
+        if (!narrowed) return smithy::Error::Serialization("Defaults.zeroFloat: value out of range");
+        parsed_member = *narrowed;
       }
       out.zeroFloat = std::move(parsed_member);
     }
@@ -1052,7 +1057,9 @@ smithy::Outcome<OperationWithDefaultsOutput> DeserializeOperationWithDefaultsOut
       {
         auto parsed = smithy::DoubleFromDocument(*member);
         if (!parsed) return smithy::Error::Serialization("OperationWithDefaultsOutput.defaultFloat: expected a number");
-        parsed_member = static_cast<float>(*parsed);
+        auto narrowed = smithy::FloatFromDouble(*parsed);
+        if (!narrowed) return smithy::Error::Serialization("OperationWithDefaultsOutput.defaultFloat: value out of range");
+        parsed_member = *narrowed;
       }
       out.defaultFloat = std::move(parsed_member);
     }
@@ -1095,6 +1102,7 @@ smithy::Outcome<OperationWithDefaultsOutput> DeserializeOperationWithDefaultsOut
     if (member != nullptr && !member->is_null()) {
       types::TestIntEnum parsed_member{};
       if (!member->is_int()) return smithy::Error::Serialization("OperationWithDefaultsOutput.defaultIntEnum: unexpected type on the wire");
+      if (member->as_int() < -2147483648LL || member->as_int() > 2147483647LL) return smithy::Error::Serialization("OperationWithDefaultsOutput.defaultIntEnum: value out of range");
       parsed_member = static_cast<types::TestIntEnum>(member->as_int());
       out.defaultIntEnum = std::move(parsed_member);
     }
@@ -1175,7 +1183,9 @@ smithy::Outcome<OperationWithDefaultsOutput> DeserializeOperationWithDefaultsOut
       {
         auto parsed = smithy::DoubleFromDocument(*member);
         if (!parsed) return smithy::Error::Serialization("OperationWithDefaultsOutput.zeroFloat: expected a number");
-        parsed_member = static_cast<float>(*parsed);
+        auto narrowed = smithy::FloatFromDouble(*parsed);
+        if (!narrowed) return smithy::Error::Serialization("OperationWithDefaultsOutput.zeroFloat: value out of range");
+        parsed_member = *narrowed;
       }
       out.zeroFloat = std::move(parsed_member);
     }
@@ -1531,6 +1541,7 @@ smithy::Outcome<std::vector<IntegerEnum>> DeserializeIntegerEnumList(const smith
     if (item->is_null()) return smithy::Error::Serialization("std::vector<IntegerEnum>: null element in a dense list");
     IntegerEnum parsed_item{};
     if (!item->is_int()) return smithy::Error::Serialization("std::vector<IntegerEnum>[]: unexpected type on the wire");
+    if (item->as_int() < -2147483648LL || item->as_int() > 2147483647LL) return smithy::Error::Serialization("std::vector<IntegerEnum>[]: value out of range");
     parsed_item = static_cast<types::IntegerEnum>(item->as_int());
     out.push_back(std::move(parsed_item));
   }
@@ -2536,7 +2547,9 @@ smithy::Outcome<SimpleScalarPropertiesInput> DeserializeSimpleScalarPropertiesIn
       {
         auto parsed = smithy::DoubleFromDocument(*member);
         if (!parsed) return smithy::Error::Serialization("SimpleScalarPropertiesInput.floatValue: expected a number");
-        parsed_member = static_cast<float>(*parsed);
+        auto narrowed = smithy::FloatFromDouble(*parsed);
+        if (!narrowed) return smithy::Error::Serialization("SimpleScalarPropertiesInput.floatValue: value out of range");
+        parsed_member = *narrowed;
       }
       out.floatValue = std::move(parsed_member);
     }
@@ -2679,7 +2692,9 @@ smithy::Outcome<SimpleScalarPropertiesOutput> DeserializeSimpleScalarPropertiesO
       {
         auto parsed = smithy::DoubleFromDocument(*member);
         if (!parsed) return smithy::Error::Serialization("SimpleScalarPropertiesOutput.floatValue: expected a number");
-        parsed_member = static_cast<float>(*parsed);
+        auto narrowed = smithy::FloatFromDouble(*parsed);
+        if (!narrowed) return smithy::Error::Serialization("SimpleScalarPropertiesOutput.floatValue: value out of range");
+        parsed_member = *narrowed;
       }
       out.floatValue = std::move(parsed_member);
     }

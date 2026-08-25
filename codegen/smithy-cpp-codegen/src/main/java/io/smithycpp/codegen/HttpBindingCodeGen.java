@@ -582,9 +582,13 @@ final class HttpBindingCodeGen {
             "$Lstatic_cast<$L>(*parsed_num)$L", open, context.cppSymbols().typeRef(target), close);
       }
       case FLOAT -> {
+        // Checked narrowing: a finite text value beyond float range would be
+        // UB to cast (UBSan float-cast-overflow), so it fails the parse.
         w.write("auto parsed_num = helpers::ParseDoubleText($L);", valueExpr);
         w.write("if (!parsed_num) return std::move(parsed_num).error();");
-        w.write("$Lstatic_cast<float>(*parsed_num)$L", open, close);
+        w.write("auto narrowed_num = smithy::FloatFromDouble(*parsed_num);");
+        w.write("if (!narrowed_num) return std::move(narrowed_num).error();");
+        w.write("$L*narrowed_num$L", open, close);
       }
       case DOUBLE -> {
         w.write("auto parsed_num = helpers::ParseDoubleText($L);", valueExpr);

@@ -43,6 +43,7 @@ GetEnumOutput MinimalGetEnumOutput() {
 GetIntEnumOutput MinimalGetIntEnumOutput() {
     return [] {
     GetIntEnumOutput v{};
+    v.result = static_cast<EnumResult>(1);
     return v;
   }();
 }

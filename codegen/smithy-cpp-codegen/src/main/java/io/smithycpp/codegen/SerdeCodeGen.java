@@ -195,12 +195,13 @@ final class SerdeCodeGen {
         w.write("if (!$L->is_bool()) $L", docExpr, wrong);
         w.write("$L = $L->as_bool();", outExpr, docExpr);
       }
-      case BYTE, SHORT, INTEGER, LONG -> {
+      case BYTE, SHORT, INTEGER, LONG, INT_ENUM -> {
         String type = context.cppSymbols().typeRef(shape);
         w.write("if (!$L->is_int()) $L", docExpr, wrong);
         if (shape.getType() != software.amazon.smithy.model.shapes.ShapeType.LONG) {
-          // Narrower integers reject out-of-range wire values instead of
-          // truncating (the malformed-request suite pins this).
+          // Narrower integers — intEnum included, its underlying type is
+          // int32 — reject out-of-range wire values instead of truncating
+          // (the malformed-request suite pins this).
           String bounds =
               switch (shape.getType()) {
                 case BYTE -> "-128 || " + docExpr + "->as_int() > 127";
@@ -216,12 +217,21 @@ final class SerdeCodeGen {
         }
         w.write("$L = static_cast<$L>($L->as_int());", outExpr, type, docExpr);
       }
-      case INT_ENUM -> {
-        String type = context.cppSymbols().typeRef(shape);
-        w.write("if (!$L->is_int()) $L", docExpr, wrong);
-        w.write("$L = static_cast<$L>($L->as_int());", outExpr, type, docExpr);
+      case FLOAT -> {
+        // The double→float narrowing is checked: a finite wire value beyond
+        // float range would be UB to cast (UBSan float-cast-overflow).
+        w.openBlock("{");
+        w.write("auto parsed = smithy::DoubleFromDocument(*$L);", docExpr);
+        w.write(
+            "if (!parsed) return smithy::Error::Serialization($S);", path + ": expected a number");
+        w.write("auto narrowed = smithy::FloatFromDouble(*parsed);");
+        w.write(
+            "if (!narrowed) return smithy::Error::Serialization($S);",
+            path + ": value out of range");
+        w.write("$L = *narrowed;", outExpr);
+        w.closeBlock("}");
       }
-      case FLOAT, DOUBLE -> {
+      case DOUBLE -> {
         String type = context.cppSymbols().typeRef(shape);
         w.openBlock("{");
         w.write("auto parsed = smithy::DoubleFromDocument(*$L);", docExpr);

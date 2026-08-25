@@ -138,6 +138,42 @@ TEST_F(SimpleRestJsonMalformedTest, WrongContentTypeIs415) {
   EXPECT_EQ(handler_->calls, 0);
 }
 
+TEST_F(SimpleRestJsonMalformedTest, IntEnumLabelBeyondInt32IsRejectedBeforeTheHandler) {
+  // The label parser bounds intEnum at int32 like Integer (issue #109's
+  // serde-side fix pins the body path; this pins the text path).
+  smithy::http::HttpRequest request;
+  request.method = "GET";
+  request.target = "/get-int-enum/99999999999";
+  const auto response = Send(request);
+  EXPECT_EQ(response.status, 400) << response.body;
+  EXPECT_EQ(response.headers.Get("x-error-type").value_or("<missing>"), "SerializationException");
+  EXPECT_EQ(handler_->calls, 0);
+}
+
+TEST_F(SimpleRestJsonMalformedTest, IntEnumLabelOutsideTheValueSetFailsValidation) {
+  // In-range but unknown values fail membership validation with the
+  // string-enum suite message, ints spelled the way smithy-rs emits them
+  // (issue #109).
+  smithy::http::HttpRequest request;
+  request.method = "GET";
+  request.target = "/get-int-enum/3";
+  const auto response = Send(request);
+  EXPECT_EQ(response.status, 400) << response.body;
+  EXPECT_EQ(response.headers.Get("x-error-type").value_or("<missing>"), "ValidationException");
+  EXPECT_EQ(handler_->calls, 0);
+
+  const auto body = smithy::json::Decode(response.body);
+  ASSERT_TRUE(body.ok()) << response.body;
+  const smithy::Document* field_list = body->Find("fieldList");
+  ASSERT_NE(field_list, nullptr) << response.body;
+  ASSERT_EQ(field_list->as_list().size(), 1u) << response.body;
+  const auto& failure = field_list->as_list()[0];
+  EXPECT_EQ(failure.Find("path")->as_string(), "/aa");
+  EXPECT_EQ(failure.Find("message")->as_string(),
+            "Value at '/aa' failed to satisfy constraint: Member must satisfy enum value set: "
+            "[1, 2]");
+}
+
 TEST_F(SimpleRestJsonMalformedTest, EnumLabelViolationReportsTheSuiteExactMessage) {
   smithy::http::HttpRequest request;
   request.method = "GET";

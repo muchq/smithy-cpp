@@ -130,7 +130,8 @@ final class ValidationGenerator {
         || hasTrait(member, target, RangeTrait.class)
         || hasTrait(member, target, PatternTrait.class)
         || hasTrait(member, target, UniqueItemsTrait.class)
-        || target.isEnumShape();
+        || target.isEnumShape()
+        || target.isIntEnumShape();
   }
 
   private static boolean hasTrait(MemberShape member, Shape target, Class<? extends Trait> t) {
@@ -418,6 +419,11 @@ final class ValidationGenerator {
               : valueExpr;
       writeEnumCheck(w, memberTarget, checked, pathVar);
     }
+    if (memberTarget.isIntEnumShape()) {
+      // intEnum can't be a map key (keys are strings), so enumAsRawString
+      // never applies here.
+      writeIntEnumCheck(w, memberTarget, valueExpr, pathVar);
+    }
   }
 
   private static String plainNumber(BigDecimal value) {
@@ -643,6 +649,39 @@ final class ValidationGenerator {
         pathVar,
         pathVar);
     w.closeBlock("}");
+    w.closeBlock("}");
+  }
+
+  private void writeIntEnumCheck(CppWriter w, Shape target, String valueExpr, String pathVar) {
+    var shape = target.asIntEnumShape().orElseThrow();
+    String type = context.cppSymbols().toSymbol(target).getName();
+    // Validity spans every member — @internal included, mirroring string
+    // enums, whose internal members FromString to a real enumerator and pass
+    // the kUnknown check — while the advertised set in the message omits
+    // them (same policy as writeEnumCheck).
+    String condition =
+        shape.members().stream()
+            .map(
+                member ->
+                    valueExpr
+                        + " != "
+                        + type
+                        + "::"
+                        + TypeGenerators.enumConstant(member.getMemberName()))
+            .collect(java.util.stream.Collectors.joining(" && "));
+    String set =
+        shape.members().stream()
+            .filter(
+                member -> !member.hasTrait(software.amazon.smithy.model.traits.InternalTrait.class))
+            .map(member -> String.valueOf(shape.getEnumValues().get(member.getMemberName())))
+            .collect(java.util.stream.Collectors.joining(", "));
+    w.openBlock("if ($L) {", condition);
+    w.write(
+        "helpers::AddValidationFailure(failures, $L, \"Value at '\" + $L + \"' failed to satisfy "
+            + "constraint: Member must satisfy enum value set: [$L]\");",
+        pathVar,
+        pathVar,
+        set);
     w.closeBlock("}");
   }
 

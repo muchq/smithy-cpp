@@ -81,6 +81,12 @@ void ValidateKitchenSink(const types::KitchenSink& value, const std::string& pat
       helpers::AddValidationFailure(failures, member_path, "Value at '" + member_path + "' failed to satisfy constraint: Member must satisfy enum value set: [low, medium, high]");
     }
   }
+  if (value.weight.has_value()) {
+    const std::string member_path = path + "/weight";
+    if ((*value.weight) != Weight::kLight && (*value.weight) != Weight::kHeavy) {
+      helpers::AddValidationFailure(failures, member_path, "Value at '" + member_path + "' failed to satisfy constraint: Member must satisfy enum value set: [1, 2]");
+    }
+  }
   if (value.uniqueNames.has_value()) {
     const std::string member_path = path + "/uniqueNames";
     {

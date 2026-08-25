@@ -45,6 +45,7 @@ GetEnumOutput MinimalGetEnumOutput() {
 GetIntEnumOutput MinimalGetIntEnumOutput() {
     return [] {
     GetIntEnumOutput v{};
+    v.result = static_cast<EnumResult>(1);
     return v;
   }();
 }
@@ -231,6 +232,7 @@ TEST(PizzaAdminServiceSmokeTest, GetIntEnumRoundTrips) {
   PizzaAdminServiceClient client = MakeClient(std::make_shared<SmokeHandler>());
     const GetIntEnumInput input = [] {
     GetIntEnumInput v{};
+    v.aa = static_cast<EnumResult>(1);
     return v;
   }();
   const auto outcome = client.GetIntEnum(input);

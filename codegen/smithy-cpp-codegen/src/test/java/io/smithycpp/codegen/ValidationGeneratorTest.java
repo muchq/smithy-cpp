@@ -104,4 +104,38 @@ class ValidationGeneratorTest {
     assertTrue(server.contains("(*value.tags).size()"), server);
     assertTrue(server.contains("Member must have length greater than or equal to 1"), server);
   }
+
+  @Test
+  void intEnumMembershipFollowsTheStringEnumPolicy() {
+    // intEnum members validate against the value set the way string enums do
+    // (issue #109; upstream suite message form, malformed-enum.smithy
+    // convention with the int spellings smithy-rs/-typescript emit): validity
+    // spans every member — @internal included — while the advertised set in
+    // the message omits internal members.
+    String server =
+        generateServer(
+            """
+            $version: "2.0"
+            namespace test.validation
+            use smithy.cpp.protocols#jsonRpc2
+
+            @jsonRpc2
+            service Svc { version: "1", operations: [Op] }
+            operation Op { input := { weight: Weight } }
+
+            intEnum Weight {
+                LIGHT = 1
+                HEAVY = 2
+
+                @internal
+                LEGACY = 99
+            }
+            """);
+    assertTrue(server.contains("!= Weight::kLight"), server);
+    assertTrue(server.contains("!= Weight::kHeavy"), server);
+    assertTrue(server.contains("!= Weight::kLegacy"), server);
+    assertTrue(
+        server.contains("failed to satisfy constraint: Member must satisfy enum value set: [1, 2]"),
+        server);
+  }
 }

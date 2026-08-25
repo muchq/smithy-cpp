@@ -24,6 +24,11 @@ Outcome<Blob> BlobFromDocument(const Document& doc);
 // "Infinity", "-Infinity".
 Outcome<double> DoubleFromDocument(const Document& doc);
 
+// Checked double→float narrowing for generated float members: a finite value
+// beyond float range is rejected (the raw cast would be undefined behavior),
+// NaN and ±Infinity pass through with their float spellings.
+Outcome<float> FloatFromDouble(double value);
+
 // Shortest round-trip decimal text (std::to_chars); non-finite values render
 // as the Smithy wire spellings "NaN" / "Infinity" / "-Infinity". Used for
 // HTTP label/query/header bindings and JSON bodies.

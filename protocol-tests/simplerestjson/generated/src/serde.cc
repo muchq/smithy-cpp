@@ -171,7 +171,9 @@ smithy::Outcome<MenuItem> DeserializeMenuItem(const smithy::Document& doc) {
     {
       auto parsed = smithy::DoubleFromDocument(*member);
       if (!parsed) return smithy::Error::Serialization("MenuItem.price: expected a number");
-      out.price = static_cast<float>(*parsed);
+      auto narrowed = smithy::FloatFromDouble(*parsed);
+      if (!narrowed) return smithy::Error::Serialization("MenuItem.price: value out of range");
+      out.price = *narrowed;
     }
   }
   return out;
@@ -478,6 +480,7 @@ smithy::Outcome<GetIntEnumInput> DeserializeGetIntEnumInput(const smithy::Docume
       return smithy::Error::Serialization("GetIntEnumInput: missing required member: aa");
     }
     if (!member->is_int()) return smithy::Error::Serialization("GetIntEnumInput.aa: unexpected type on the wire");
+    if (member->as_int() < -2147483648LL || member->as_int() > 2147483647LL) return smithy::Error::Serialization("GetIntEnumInput.aa: value out of range");
     out.aa = static_cast<types::EnumResult>(member->as_int());
   }
   return out;
@@ -498,6 +501,7 @@ smithy::Outcome<GetIntEnumOutput> DeserializeGetIntEnumOutput(const smithy::Docu
       return smithy::Error::Serialization("GetIntEnumOutput: missing required member: result");
     }
     if (!member->is_int()) return smithy::Error::Serialization("GetIntEnumOutput.result: unexpected type on the wire");
+    if (member->as_int() < -2147483648LL || member->as_int() > 2147483647LL) return smithy::Error::Serialization("GetIntEnumOutput.result: value out of range");
     out.result = static_cast<types::EnumResult>(member->as_int());
   }
   return out;

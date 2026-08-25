@@ -83,6 +83,42 @@ TEST(DocumentSerdeTest, DoubleFromDocumentAcceptsNonFiniteSpellings) {
   EXPECT_FALSE(DoubleFromDocument(Document(true)).ok());
 }
 
+TEST(DocumentSerdeTest, FloatFromDoubleNarrowsInRangeValues) {
+  EXPECT_EQ(*FloatFromDouble(1.5), 1.5F);
+  EXPECT_EQ(*FloatFromDouble(-2.25), -2.25F);
+  EXPECT_EQ(*FloatFromDouble(0.0), 0.0F);
+  // The exact float extremes are in range, not rejected.
+  EXPECT_EQ(*FloatFromDouble(std::numeric_limits<float>::max()), std::numeric_limits<float>::max());
+  EXPECT_EQ(*FloatFromDouble(-std::numeric_limits<float>::max()),
+            -std::numeric_limits<float>::max());
+  // Values below float precision round (here: to zero) — rounding is not an
+  // error, only magnitude overflow is.
+  EXPECT_EQ(*FloatFromDouble(1e-300), 0.0F);
+}
+
+TEST(DocumentSerdeTest, FloatFromDoubleRejectsFiniteOverflow) {
+  // The raw static_cast would be UB for these ([conv.double]); a hostile
+  // request body carrying 1e300 for a float member must fail the parse.
+  EXPECT_FALSE(FloatFromDouble(1e300).ok());
+  EXPECT_FALSE(FloatFromDouble(-1e300).ok());
+  EXPECT_FALSE(FloatFromDouble(std::numeric_limits<double>::max()).ok());
+  // Just past the float edge in double precision is already overflow.
+  EXPECT_FALSE(
+      FloatFromDouble(std::nextafter(static_cast<double>(std::numeric_limits<float>::max()),
+                                     std::numeric_limits<double>::infinity()))
+          .ok());
+}
+
+TEST(DocumentSerdeTest, FloatFromDoublePassesNonFiniteThrough) {
+  // Smithy float carries NaN/±Infinity on every wire; narrowing them is
+  // well-defined and must not be caught in the overflow net.
+  EXPECT_TRUE(std::isnan(*FloatFromDouble(std::numeric_limits<double>::quiet_NaN())));
+  EXPECT_EQ(*FloatFromDouble(std::numeric_limits<double>::infinity()),
+            std::numeric_limits<float>::infinity());
+  EXPECT_EQ(*FloatFromDouble(-std::numeric_limits<double>::infinity()),
+            -std::numeric_limits<float>::infinity());
+}
+
 TEST(DocumentSerdeTest, FormatFloatingPoint) {
   EXPECT_EQ(FormatDouble(4.1), "4.1");
   EXPECT_EQ(FormatFloat(4.1F), "4.1");

@@ -53,6 +53,17 @@ Outcome<double> DoubleFromDocument(const Document& doc) {
   return Error::Serialization("number: expected a number or NaN/Infinity/-Infinity");
 }
 
+Outcome<float> FloatFromDouble(double value) {
+  // Only finite out-of-range values are rejected: casting those is undefined
+  // behavior ([conv.double]), while NaN and ±Infinity narrow losslessly and
+  // are legal Smithy float values on every wire.
+  if (std::isfinite(value) &&
+      (value < -std::numeric_limits<float>::max() || value > std::numeric_limits<float>::max())) {
+    return Error::Serialization("number: value out of float range");
+  }
+  return static_cast<float>(value);
+}
+
 namespace {
 template <typename T>
 std::string FormatFloating(T value) {

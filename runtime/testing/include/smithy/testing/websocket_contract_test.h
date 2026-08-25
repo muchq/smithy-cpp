@@ -335,6 +335,103 @@ TYPED_TEST_P(WebSocketContractTest, ASecondSendClassOperationRefusesWhileOneIsPa
   ender.join();
 }
 
+// The receive deadline's async half (#130): on a quiet wire the parked
+// receive completes with Error::Timeout — and, exactly like the blocking
+// overload, the timeout is not terminal: the slot is released (a second
+// timed receive parks and times out the same way) and the session still
+// answers a terminal transition afterwards.
+TYPED_TEST_P(WebSocketContractTest, ATimedReceiveOnAQuietWireTimesOutAndReleasesItsSlot) {
+  TypeParam driver;
+  std::shared_ptr<http::WebSocket> socket = driver.Socket();
+
+  for (int round = 0; round < 2; ++round) {
+    ContractMailbox<Outcome<std::optional<eventstream::Message>>> timed;
+    socket->ReceiveAsync(
+        std::chrono::milliseconds(50),
+        [&timed](Outcome<std::optional<eventstream::Message>> got) { timed.Post(std::move(got)); });
+    auto expired = timed.Wait();
+    ASSERT_FALSE(expired.ok()) << "round " << round;
+    EXPECT_EQ(expired.error().code(), "TimeoutError") << "round " << round;
+  }
+
+  // The session survived both deadlines: a parked receive still completes
+  // through the terminal transition, not as a leak.
+  ContractMailbox<Outcome<std::optional<eventstream::Message>>> parked;
+  socket->ReceiveAsync(
+      [&parked](Outcome<std::optional<eventstream::Message>> got) { parked.Post(std::move(got)); });
+  std::thread ender([&] { driver.EndSessionFromPeer(); });
+  ender.join();
+  auto terminal = parked.Wait();
+  if (!terminal.ok()) {
+    EXPECT_NE(terminal.error().code(), "TimeoutError");
+  }
+}
+
+// A non-positive deadline polls: nothing already in hand completes as a
+// timeout without waiting (the blocking overload's documented poll shape).
+TYPED_TEST_P(WebSocketContractTest, ANonPositiveTimedReceivePolls) {
+  TypeParam driver;
+  std::shared_ptr<http::WebSocket> socket = driver.Socket();
+  ContractMailbox<Outcome<std::optional<eventstream::Message>>> polled;
+
+  socket->ReceiveAsync(
+      std::chrono::milliseconds(0),
+      [&polled](Outcome<std::optional<eventstream::Message>> got) { polled.Post(std::move(got)); });
+  auto expired = polled.Wait();
+  ASSERT_FALSE(expired.ok());
+  EXPECT_EQ(expired.error().code(), "TimeoutError");
+
+  std::thread ender([&] { driver.EndSessionFromPeer(); });
+  ender.join();
+}
+
+// A terminal transition that arrives before the deadline owns the parked
+// timed receive: it completes with the session's terminal outcome, never
+// with the timeout — and the deadline that later fires into the emptied
+// slot must be a no-op, not a second completion (the mailbox asserts
+// exactly one arrival).
+TYPED_TEST_P(WebSocketContractTest, ATerminalTransitionBeatsAParkedTimedReceivesDeadline) {
+  TypeParam driver;
+  std::shared_ptr<http::WebSocket> socket = driver.Socket();
+  ContractMailbox<Outcome<std::optional<eventstream::Message>>> parked;
+
+  socket->ReceiveAsync(
+      std::chrono::seconds(30),
+      [&parked](Outcome<std::optional<eventstream::Message>> got) { parked.Post(std::move(got)); });
+  ASSERT_TRUE(parked.Empty()) << "the timed receive should park on a quiet wire";
+
+  std::thread ender([&] { driver.EndSessionFromPeer(); });
+  ender.join();
+  auto terminal = parked.Wait();
+  if (!terminal.ok()) {
+    EXPECT_NE(terminal.error().code(), "TimeoutError");
+  }
+}
+
+// The one-outstanding rule spans the deadline overload: a second receive
+// refuses while a timed one is parked, and the parked one still completes.
+TYPED_TEST_P(WebSocketContractTest, ASecondReceiveRefusesWhileATimedOneIsParked) {
+  TypeParam driver;
+  std::shared_ptr<http::WebSocket> socket = driver.Socket();
+  ContractMailbox<Outcome<std::optional<eventstream::Message>>> first;
+  ContractMailbox<Outcome<std::optional<eventstream::Message>>> second;
+
+  socket->ReceiveAsync(
+      std::chrono::seconds(30),
+      [&first](Outcome<std::optional<eventstream::Message>> got) { first.Post(std::move(got)); });
+  ASSERT_TRUE(first.Empty()) << "the timed receive should park on a quiet wire";
+
+  socket->ReceiveAsync(
+      [&second](Outcome<std::optional<eventstream::Message>> got) { second.Post(std::move(got)); });
+  auto refusal = second.Wait();
+  ASSERT_FALSE(refusal.ok());
+  EXPECT_EQ(refusal.error().kind(), ErrorKind::kValidation);
+
+  std::thread ender([&] { driver.EndSessionFromPeer(); });
+  ender.join();
+  (void)first.Wait();
+}
+
 // One outstanding receive-class operation per session, same shape.
 TYPED_TEST_P(WebSocketContractTest, ASecondReceiveClassOperationRefusesWhileOneIsParked) {
   TypeParam driver;
@@ -363,6 +460,10 @@ REGISTER_TYPED_TEST_SUITE_P(WebSocketContractTest,
                             ATerminalTransitionCompletesALoneParkedCoroutineSend,
                             ATerminalTransitionCompletesALoneParkedReceive,
                             ASecondSendClassOperationRefusesWhileOneIsParked,
+                            ATimedReceiveOnAQuietWireTimesOutAndReleasesItsSlot,
+                            ANonPositiveTimedReceivePolls,
+                            ATerminalTransitionBeatsAParkedTimedReceivesDeadline,
+                            ASecondReceiveRefusesWhileATimedOneIsParked,
                             ASecondReceiveClassOperationRefusesWhileOneIsParked);
 
 }  // namespace smithy::testing

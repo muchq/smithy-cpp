@@ -13,6 +13,7 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <future>
 #include <memory>
 #include <optional>
 #include <string>
@@ -315,6 +316,39 @@ TEST(JsonRpcStreamSocketTest, ADeadlineDelegatesAndATimeoutIsNotAViolation) {
       MakeEventMessage("message", "application/json", Blob::FromString(R"({"text":"late"})"));
   ASSERT_TRUE(client->Send(event).ok());
   auto received = server->Receive(std::chrono::seconds(5));
+  ASSERT_TRUE(received.ok()) << received.error().message();
+  ASSERT_TRUE(received->has_value());
+  EXPECT_EQ(**received, event);
+}
+
+TEST(JsonRpcStreamSocketTest, TheAsyncDeadlineDelegatesAndATimeoutIsNotAViolation) {
+  // The #130 twin of the blocking case above: the timeout rides through
+  // the classifier untouched, and the envelope that arrives after it is
+  // policed for the next receive exactly as if no deadline had passed.
+  auto [left, right] = http::InMemoryWebSocketPair::Create();
+  auto client = Wrap(left, JsonRpcStreamSocket::Role::kClient);
+  auto server = Wrap(right, JsonRpcStreamSocket::Role::kServer);
+
+  std::promise<Outcome<std::optional<Message>>> timed;
+  server->ReceiveAsync(std::chrono::milliseconds(50), [&timed](Outcome<std::optional<Message>> m) {
+    timed.set_value(std::move(m));
+  });
+  auto timed_future = timed.get_future();
+  ASSERT_EQ(timed_future.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+  auto nothing = timed_future.get();
+  ASSERT_FALSE(nothing.ok());
+  EXPECT_EQ(nothing.error().code(), "TimeoutError");
+
+  const Message event =
+      MakeEventMessage("message", "application/json", Blob::FromString(R"({"text":"late"})"));
+  ASSERT_TRUE(client->Send(event).ok());
+  std::promise<Outcome<std::optional<Message>>> next;
+  server->ReceiveAsync(std::chrono::seconds(30), [&next](Outcome<std::optional<Message>> m) {
+    next.set_value(std::move(m));
+  });
+  auto next_future = next.get_future();
+  ASSERT_EQ(next_future.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+  auto received = next_future.get();
   ASSERT_TRUE(received.ok()) << received.error().message();
   ASSERT_TRUE(received->has_value());
   EXPECT_EQ(**received, event);

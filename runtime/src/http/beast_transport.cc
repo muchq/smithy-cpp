@@ -10,6 +10,7 @@
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/post.hpp>
 #include <boost/asio/ssl.hpp>
+#include <boost/asio/steady_timer.hpp>
 #include <boost/asio/strand.hpp>
 #include <boost/asio/thread_pool.hpp>
 #include <boost/beast/core.hpp>
@@ -357,6 +358,24 @@ class WsSession final : public WebSocketSessionBase,
   // The completion-driven twin (ADR-0019): one outstanding receive-class
   // operation per session, completion on the connection's executor.
   void ReceiveAsync(WebSocket::ReceiveCallback callback) override {
+    ReceiveAsyncWithin(std::nullopt, std::move(callback));
+  }
+
+  // The deadline overload (#130): same immediate paths, and a parked
+  // receive races its deadline instead of waiting forever.
+  void ReceiveAsync(std::chrono::milliseconds timeout,
+                    WebSocket::ReceiveCallback callback) override {
+    ReceiveAsyncWithin(timeout, std::move(callback));
+  }
+
+  // Both async receives: `timeout` engaged bounds the park with a timer on
+  // the connection's executor, disengaged parks until Deliver or a
+  // terminal transition. The park generation settles the timer/delivery
+  // race exactly once under mutex_: every park bumps it, the timer fires
+  // only for the generation it was armed with, so a stale deadline can
+  // never time out a later receive (timed or not).
+  void ReceiveAsyncWithin(std::optional<std::chrono::milliseconds> timeout,
+                          WebSocket::ReceiveCallback callback) {
     Outcome<std::optional<eventstream::Message>> immediate = std::optional<eventstream::Message>();
     bool ready_message = false;
     {
@@ -376,9 +395,27 @@ class WsSession final : public WebSocketSessionBase,
         immediate = std::optional<eventstream::Message>();
       } else if (failed_) {
         immediate = Error::Transport("websocket: " + error_);
+      } else if (timeout.has_value() && *timeout <= std::chrono::milliseconds::zero()) {
+        // The blocking overload's poll shape: nothing already in hand is a
+        // timeout, inline like the other immediates below.
+        immediate = Error::Timeout("websocket: no message within the receive deadline");
       } else {
         pending_receive_ = std::move(callback);
-        return;  // Deliver / the terminal transitions complete it
+        ++receive_park_generation_;  // a stale deadline must not fire this park
+        if (timeout.has_value()) {
+          try {
+            ArmReceiveDeadlineLocked(*timeout);
+          } catch (...) {
+            // Could not schedule the deadline: an unbounded park would
+            // betray the caller's whole ask, so refuse instead.
+            WebSocket::ReceiveCallback refused = std::exchange(pending_receive_, nullptr);
+            wake_.notify_all();
+            lock.unlock();
+            refused(Error::Transport("websocket: cannot schedule the receive deadline"));
+            return;
+          }
+        }
+        return;  // Deliver / the deadline / the terminal transitions complete it
       }
     }
     if (!ready_message) {
@@ -401,6 +438,42 @@ class WsSession final : public WebSocketSessionBase,
     } catch (...) {
       callback(Error::Transport("websocket: cannot schedule the completion"));
     }
+  }
+
+  // With mutex_ held: (re)arms the one receive-deadline timer for the park
+  // that just went in. Emplacing destroys a previous timer, cancelling its
+  // pending wait (the handler sees operation_aborted and returns) — and the
+  // generation check makes even an uncancelled stale wait harmless. The
+  // handler captures the session weakly: a deadline must never extend a
+  // session's life.
+  void ArmReceiveDeadlineLocked(std::chrono::milliseconds timeout) {
+    receive_deadline_.emplace(ws_.get_executor());
+    receive_deadline_->expires_after(timeout);
+    receive_deadline_->async_wait(
+        [weak = this->weak_from_this(),
+         generation = receive_park_generation_](const boost::system::error_code& ec) {
+          if (ec) return;  // cancelled: a newer park re-armed, or teardown
+          if (auto self = weak.lock()) self->OnReceiveDeadline(generation);
+        });
+  }
+
+  void OnReceiveDeadline(std::uint64_t generation) {
+    WebSocket::ReceiveCallback expired;
+    {
+      const std::lock_guard<std::mutex> lock(mutex_);
+      if (!pending_receive_ || receive_park_generation_ != generation) {
+        return;  // the park this deadline bounded already completed
+      }
+      expired = std::exchange(pending_receive_, nullptr);
+      // A blocking receiver may be waiting behind the parked slot; the
+      // freed slot is part of its wake condition.
+      wake_.notify_all();
+    }
+    // The timer fired on the connection's executor — the completion
+    // context — so contain a throwing application callback (ADR-0003).
+    InvokeCompletion("websocket receive", expired,
+                     Outcome<std::optional<eventstream::Message>>(
+                         Error::Timeout("websocket: no message within the receive deadline")));
   }
 
   Outcome<Unit> Send(const eventstream::Message& message) override {
@@ -873,6 +946,12 @@ class WsSession final : public WebSocketSessionBase,
   // transition takes and fires them exactly once (TakeAsyncWaitersLocked).
   WebSocket::ReceiveCallback pending_receive_;
   WebSocket::SendCallback pending_send_;
+  // Bumped on every pending_receive_ park; a receive deadline fires only
+  // for the generation it was armed with (the timed-receive race settles
+  // here). The timer is optional so it can be (re)constructed on the
+  // connection's executor per timed park.
+  std::uint64_t receive_park_generation_ = 0;
+  std::optional<asio::steady_timer> receive_deadline_;
   int blocked_receivers_ = 0;
   bool read_paused_ = false;
   bool peer_closed_ = false;  // clean close: Receive's nullopt
@@ -2236,6 +2315,10 @@ class DialedWebSocket final : public WebSocket {
   void Close() override { session_->Close(); }
   void ReceiveAsync(WebSocket::ReceiveCallback callback) override {
     session_->ReceiveAsync(std::move(callback));
+  }
+  void ReceiveAsync(std::chrono::milliseconds timeout,
+                    WebSocket::ReceiveCallback callback) override {
+    session_->ReceiveAsync(timeout, std::move(callback));
   }
   void SendAsync(const eventstream::Message& message, WebSocket::SendCallback callback) override {
     session_->SendAsync(message, std::move(callback));

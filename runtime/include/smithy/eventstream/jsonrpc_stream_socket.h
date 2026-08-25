@@ -76,6 +76,11 @@ class JsonRpcStreamSocket final : public http::WebSocket {
   Outcome<Unit> Send(const Message& message) override;
   void Close() override;
   void ReceiveAsync(ReceiveCallback callback) override;
+  // The async deadline (#130), worn by the wrapper the way the blocking
+  // one is: a timeout is the inner Error::Timeout verbatim — no envelope
+  // classification runs on it, nothing is closed, and the stream picks up
+  // where it left off.
+  void ReceiveAsync(std::chrono::milliseconds timeout, ReceiveCallback callback) override;
   void SendAsync(const Message& message, SendCallback callback) override;
   bool SupportsAsync() const override;
 
@@ -83,6 +88,11 @@ class JsonRpcStreamSocket final : public http::WebSocket {
   // Both receive overloads: police one inbound outcome per ADR-0023 —
   // answer a violation, close if the frame was fatal, hand back the rest.
   Outcome<std::optional<Message>> Police(Outcome<std::optional<Message>> raw);
+
+  // Both async receives: the classifying completion that Police-es one
+  // inbound outcome before handing it to `callback` — shared so the timed
+  // and untimed paths cannot drift.
+  ReceiveCallback PoliceAsync(ReceiveCallback callback);
 
   // Engaged only by the owning form; every call goes through inner_.
   std::shared_ptr<http::WebSocket> owner_;

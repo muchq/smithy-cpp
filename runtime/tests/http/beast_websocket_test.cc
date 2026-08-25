@@ -172,6 +172,48 @@ TEST(BeastWebSocketTest, ATimedOutReceiveReleasesTheOneOutstandingSlotOnTheWire)
   server.Stop();
 }
 
+TEST(BeastWebSocketTest, AnAsyncReceiveDeadlineExpiresAndDeliveryStillBeatsALaterOne) {
+  // The #130 async twin over the real wire: the deadline timer lives on
+  // the connection's executor, so the timer/delivery race the pair pins in
+  // memory gets its own proof against Beast's io machinery.
+  BeastServerTransport server(EchoOptions());
+  ASSERT_TRUE(server.Start(NotFoundHandler()).ok());
+
+  auto dialed = BeastWebSocketClient::Dial({.host = "127.0.0.1", .port = server.port()});
+  ASSERT_TRUE(dialed.ok()) << dialed.error().message();
+  const std::shared_ptr<WebSocket>& socket = *dialed;
+
+  // Quiet wire: the parked timed receive completes with the timeout, on
+  // the executor, and the session is untouched.
+  std::promise<Outcome<std::optional<Message>>> timed;
+  socket->ReceiveAsync(std::chrono::milliseconds(75), [&timed](Outcome<std::optional<Message>> m) {
+    timed.set_value(std::move(m));
+  });
+  auto timed_future = timed.get_future();
+  ASSERT_EQ(timed_future.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+  auto expired = timed_future.get();
+  ASSERT_FALSE(expired.ok());
+  EXPECT_EQ(expired.error().code(), "TimeoutError");
+
+  // Same session, fresh deadline: the echo arrives well inside it, the
+  // delivery wins the race, and the stale first timer never fires into
+  // this park (set_value would abort on a second completion).
+  std::promise<Outcome<std::optional<Message>>> delivered;
+  socket->ReceiveAsync(std::chrono::seconds(30), [&delivered](Outcome<std::optional<Message>> m) {
+    delivered.set_value(std::move(m));
+  });
+  ASSERT_TRUE(socket->Send(Text("chat", "beats the deadline")).ok());
+  auto delivered_future = delivered.get_future();
+  ASSERT_EQ(delivered_future.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+  auto echo = delivered_future.get();
+  ASSERT_TRUE(echo.ok()) << echo.error().message();
+  ASSERT_TRUE(echo->has_value());
+  EXPECT_EQ((**echo).payload.ToString(), "echo:beats the deadline");
+
+  socket->Close();
+  server.Stop();
+}
+
 TEST(BeastWebSocketTest, AThrowingAsyncReceiveCallbackDoesNotKillTheSession) {
   // ADR-0003/#109: an application completion callback that throws runs on the
   // connection's io thread. It must be contained there — never unwind

@@ -4,9 +4,11 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdint>
 #include <deque>
 #include <mutex>
 #include <optional>
+#include <thread>
 #include <utility>
 
 #include "smithy/eventstream/frame.h"
@@ -44,6 +46,10 @@ struct PairState {
   // two halves, same shape as the Beast session).
   std::array<WebSocket::ReceiveCallback, 2> pending_receive;
   std::array<std::optional<PendingSend>, 2> pending_send;
+  // Bumped on every pending_receive park; a receive-deadline watchdog fires
+  // only for the generation it was armed with, so a stale deadline can
+  // never time out a later receive (#130).
+  std::array<std::uint64_t, 2> receive_park_generation{};
   std::array<int, 2> blocked_receivers{};
   std::array<int, 2> blocked_senders{};
   bool closed = false;
@@ -132,30 +138,14 @@ class PairEnd final : public WebSocket {
   }
 
   void ReceiveAsync(WebSocket::ReceiveCallback callback) override {
-    WebSocket::SendCallback absorbed;
-    Outcome<std::optional<eventstream::Message>> immediate = std::optional<eventstream::Message>();
-    {
-      const std::lock_guard<std::mutex> lock(state_->mutex);
-      if (state_->pending_receive[send_index_] || state_->blocked_receivers[send_index_] > 0) {
-        callback(Error::Validation("websocket pair: a receive is already outstanding"));
-        return;
-      }
-      std::deque<eventstream::Message>& inbound = state_->queues[1 - send_index_];
-      if (!inbound.empty()) {
-        eventstream::Message message = std::move(inbound.front());
-        inbound.pop_front();
-        absorbed = AbsorbPeerPendingSendLocked();
-        state_->changed.notify_all();
-        immediate = std::optional<eventstream::Message>(std::move(message));
-      } else if (state_->closed) {
-        immediate = std::optional<eventstream::Message>();
-      } else {
-        state_->pending_receive[send_index_] = std::move(callback);
-        return;  // a send or the close completes it
-      }
-    }
-    if (absorbed) absorbed(Unit{});
-    callback(std::move(immediate));
+    ReceiveAsyncWithin(std::nullopt, std::move(callback));
+  }
+
+  // The deadline overload (#130): same immediate paths, and a parked
+  // receive races its deadline instead of waiting forever.
+  void ReceiveAsync(std::chrono::milliseconds timeout,
+                    WebSocket::ReceiveCallback callback) override {
+    ReceiveAsyncWithin(timeout, std::move(callback));
   }
 
   void SendAsync(const eventstream::Message& message, WebSocket::SendCallback callback) override {
@@ -195,6 +185,78 @@ class PairEnd final : public WebSocket {
   bool SupportsAsync() const override { return true; }
 
  private:
+  // Both async receives: `timeout` engaged bounds the park, disengaged
+  // parks until a send or the close completes it. The pair has no executor
+  // to run a timer on, so a timed park arms a detached watchdog thread —
+  // short-lived (it exits at the deadline or as soon as the park
+  // completes), and it owns nothing but the shared state it sleeps on. The
+  // park generation settles the watchdog/delivery race exactly once under
+  // the state mutex, so a stale deadline can never time out a later
+  // receive (timed or not).
+  void ReceiveAsyncWithin(std::optional<std::chrono::milliseconds> timeout,
+                          WebSocket::ReceiveCallback callback) {
+    WebSocket::SendCallback absorbed;
+    Outcome<std::optional<eventstream::Message>> immediate = std::optional<eventstream::Message>();
+    {
+      const std::lock_guard<std::mutex> lock(state_->mutex);
+      if (state_->pending_receive[send_index_] || state_->blocked_receivers[send_index_] > 0) {
+        callback(Error::Validation("websocket pair: a receive is already outstanding"));
+        return;
+      }
+      std::deque<eventstream::Message>& inbound = state_->queues[1 - send_index_];
+      if (!inbound.empty()) {
+        eventstream::Message message = std::move(inbound.front());
+        inbound.pop_front();
+        absorbed = AbsorbPeerPendingSendLocked();
+        state_->changed.notify_all();
+        immediate = std::optional<eventstream::Message>(std::move(message));
+      } else if (state_->closed) {
+        immediate = std::optional<eventstream::Message>();
+      } else if (timeout.has_value() && *timeout <= std::chrono::milliseconds::zero()) {
+        // The blocking overload's poll shape: nothing already in hand is a
+        // timeout, completed inline like the other immediates.
+        immediate = Error::Timeout("websocket pair: no message within the receive deadline");
+      } else {
+        state_->pending_receive[send_index_] = std::move(callback);
+        ++state_->receive_park_generation[send_index_];
+        if (timeout.has_value()) {
+          ArmReceiveDeadlineLocked(*timeout);
+        }
+        return;  // a send, the deadline, or the close completes it
+      }
+    }
+    if (absorbed) absorbed(Unit{});
+    callback(std::move(immediate));
+  }
+
+  // With the lock held: spawns the watchdog for the park that just went
+  // in. It sleeps on the shared condition variable, so a completed park
+  // (delivery, close, or a fresh park's bumped generation) releases it
+  // early; at the deadline, a park still bearing its generation is timed
+  // out — the slot is released exactly as a delivery releases it, and the
+  // session is untouched.
+  void ArmReceiveDeadlineLocked(std::chrono::milliseconds timeout) {
+    std::thread([state = state_, end = send_index_,
+                 generation = state_->receive_park_generation[send_index_],
+                 deadline = std::chrono::steady_clock::now() + timeout] {
+      WebSocket::ReceiveCallback expired;
+      {
+        std::unique_lock<std::mutex> lock(state->mutex);
+        state->changed.wait_until(lock, deadline, [&] {
+          return !state->pending_receive[end] || state->receive_park_generation[end] != generation;
+        });
+        if (!state->pending_receive[end] || state->receive_park_generation[end] != generation) {
+          return;  // the park this deadline bounded already completed
+        }
+        expired = std::exchange(state->pending_receive[end], nullptr);
+        // A blocking receiver may be waiting behind the parked slot; the
+        // freed slot is part of its wake condition.
+        state->changed.notify_all();
+      }
+      expired(Error::Timeout("websocket pair: no message within the receive deadline"));
+    }).detach();
+  }
+
   // Both receive overloads: `timeout` engaged bounds the wait, disengaged
   // is the unbounded blocking call.
   Outcome<std::optional<eventstream::Message>> ReceiveWithin(
@@ -247,6 +309,9 @@ class PairEnd final : public WebSocket {
     WebSocket::ReceiveCallback& parked = state_->pending_receive[1 - send_index_];
     if (!parked) return nullptr;
     delivered = message;
+    // The emptied slot releases a deadline watchdog sleeping on it (#130);
+    // harmless for everyone else.
+    state_->changed.notify_all();
     return std::exchange(parked, nullptr);
   }
 

@@ -198,6 +198,31 @@ class WebSocket {
         "check; the blocking Receive/Send still work)"));
   }
 
+  // The blocking deadline's completion-driven twin (#130): the callback
+  // fires exactly once with the same four outcomes as Receive(timeout) —
+  // the message, the peer's clean close (nullopt), the session's permanent
+  // error, or Error::Timeout ("TimeoutError") when the budget runs out
+  // with nothing to report. Exactly like the blocking overload, a timeout
+  // is not terminal: the session is untouched and usable, and the receive
+  // slot is released exactly as a completed receive releases it — the next
+  // receive (either API) may park again, and a message the wire delivers
+  // after the deadline waits in the session for it. A non-positive timeout
+  // polls: it completes inline with what is already in hand, or with the
+  // timeout. The one-outstanding-receive rule is unchanged.
+  //
+  // The timeout must race the completion and settle exactly once — the
+  // implementation owns that race the same way it owns the parked slot
+  // (there is nowhere honest to bound the wait from outside; the blocking
+  // overload's doc block explains why). The refusing default keeps every
+  // existing implementor compiling; the contract suite holds anything that
+  // reports SupportsAsync() to overriding this too.
+  virtual void ReceiveAsync(std::chrono::milliseconds timeout, ReceiveCallback callback) {
+    (void)timeout;
+    callback(Error::Validation(
+        "websocket: this implementation has no deadline-bounded async receive (the untimed "
+        "ReceiveAsync and the blocking Receive(timeout) may still work)"));
+  }
+
   virtual void SendAsync(const eventstream::Message& message, SendCallback callback) {
     (void)message;
     callback(Error::Validation(

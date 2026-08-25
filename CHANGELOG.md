@@ -45,6 +45,22 @@ policy in [docs/versioning.md](docs/versioning.md).
 
 ### Added
 
+- **A deadline for the coroutine receive** (#130).
+  `co_await stream.Receive(timeout)` on `AsyncEventStream` (and
+  `ReceiveMessage(socket, timeout)` for the raw awaitable) resolves with
+  `Error::Timeout` (code `TimeoutError`) when nothing arrives in time — the
+  completion-driven twin of the blocking `Receive(timeout)`, with the same
+  rule: a timeout is not terminal, the receive slot is released, and a
+  message the wire delivers after the deadline waits for the next await. A
+  `Detached` serve loop can now bound every await instead of parking its
+  frame forever on a peer that never sends. One layer down it is
+  `WebSocket::ReceiveAsync(timeout, callback)` — a refusing default (the
+  async family is opt-in), implemented by both transports (a timer on the
+  connection's executor for Beast; a watchdog for the executor-less
+  in-memory pair) and passed through by `JsonRpcStreamSocket`, with the
+  timeout/delivery race settled exactly once by a park generation. The
+  shared WebSocket contract suite grows four deadline cases every
+  implementation runs, in-repo and out.
 - **Servers validate intEnum membership** (#109). String enums already
   failed request validation outside the modeled value set; intEnum members
   were accepted silently. They now produce the same suite-exact

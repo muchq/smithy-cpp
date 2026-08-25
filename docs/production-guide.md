@@ -461,6 +461,15 @@ code holding a raw session; a hand-rolled socket (a test fake, an adapter
 over another WebSocket library) owes its callers a wait that actually ends
 and an `Error::Timeout` when it does.
 
+The completion-driven half has the same deadline (#130):
+`co_await stream.Receive(std::chrono::seconds(2))` on an `AsyncEventStream`
+resolves with the same four outcomes and the same rule — a timeout releases
+the receive slot and leaves the session usable, and an event the wire
+delivers after the deadline waits for the next await. One layer down it is
+`WebSocket::ReceiveAsync(timeout, callback)`, a refusing default rather than
+a pure virtual (the async family is opt-in), with the shared contract suite
+holding every `SupportsAsync()` implementation to it.
+
 Not every `ClientConfig` knob reaches a streaming dial — the upgrade GET is
 not a unary request:
 

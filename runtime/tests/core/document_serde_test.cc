@@ -3,7 +3,9 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <cstdlib>
 #include <limits>
+#include <string>
 
 #include "smithy/core/uuid.h"
 
@@ -96,17 +98,33 @@ TEST(DocumentSerdeTest, FloatFromDoubleNarrowsInRangeValues) {
   EXPECT_EQ(*FloatFromDouble(1e-300), 0.0F);
 }
 
+TEST(DocumentSerdeTest, FloatFromDoubleAcceptsDoublesThatRoundToFloatMax) {
+  // Shortest-round-trip float text — what FormatFloat itself emits for
+  // FLT_MAX — parses to a double slightly above FLT_MAX that still rounds
+  // back to it. Rejecting at FLT_MAX instead of the true overflow boundary
+  // would 400 this library's own wire output.
+  const std::string text = FormatFloat(std::numeric_limits<float>::max());
+  const double reparsed = std::strtod(text.c_str(), nullptr);
+  EXPECT_GT(reparsed, static_cast<double>(std::numeric_limits<float>::max()));
+  ASSERT_TRUE(FloatFromDouble(reparsed).ok()) << text;
+  EXPECT_EQ(*FloatFromDouble(reparsed), std::numeric_limits<float>::max());
+  // Anything strictly below the round-to-nearest overflow boundary
+  // (2^128 - 2^103) rounds to FLT_MAX and stays accepted.
+  const double just_below_bound = std::nextafter(0x1.ffffffp+127, 0.0);
+  EXPECT_EQ(*FloatFromDouble(just_below_bound), std::numeric_limits<float>::max());
+  EXPECT_EQ(*FloatFromDouble(-just_below_bound), -std::numeric_limits<float>::max());
+}
+
 TEST(DocumentSerdeTest, FloatFromDoubleRejectsFiniteOverflow) {
   // The raw static_cast would be UB for these ([conv.double]); a hostile
   // request body carrying 1e300 for a float member must fail the parse.
   EXPECT_FALSE(FloatFromDouble(1e300).ok());
   EXPECT_FALSE(FloatFromDouble(-1e300).ok());
   EXPECT_FALSE(FloatFromDouble(std::numeric_limits<double>::max()).ok());
-  // Just past the float edge in double precision is already overflow.
-  EXPECT_FALSE(
-      FloatFromDouble(std::nextafter(static_cast<double>(std::numeric_limits<float>::max()),
-                                     std::numeric_limits<double>::infinity()))
-          .ok());
+  // The exact round-to-nearest overflow boundary (ties-to-even lands on
+  // 2^128) is the first rejected value, in both directions.
+  EXPECT_FALSE(FloatFromDouble(0x1.ffffffp+127).ok());
+  EXPECT_FALSE(FloatFromDouble(-0x1.ffffffp+127).ok());
 }
 
 TEST(DocumentSerdeTest, FloatFromDoublePassesNonFiniteThrough) {

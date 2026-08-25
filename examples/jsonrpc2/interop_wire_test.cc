@@ -140,14 +140,17 @@ TEST(JsonRpc2InteropTest, GeneratedClientTalksToAHandRolledPeer) {
 }
 
 // error.code is classified on the full int64 (issue #109): a peer sending
-// 5*2^32+503 must not be read as HTTP 503 — the old static_cast<int>
-// truncation did exactly that, marking the error retryable and misrouting
-// status-based handling. Out-of-band codes collapse to the 400 class.
+// 21474836983 = 5*2^32+503 must not be read as HTTP 503 — the old
+// static_cast<int> truncation did exactly that, marking the error retryable
+// and misrouting status-based handling. Out-of-band codes collapse to the
+// 400 class. The constant is chosen so the pre-fix code lands *inside* the
+// 100-599 window (as a retryable 503): a value that truncates outside it
+// would classify as 400 under old and new code alike and pin nothing.
 class HugeErrorCodePeer final : public smithy::http::HttpClient {
  public:
   smithy::Outcome<smithy::http::HttpResponse> Send(const smithy::http::HttpRequest&) override {
     smithy::http::HttpResponse response{
-        200, {}, R"({"jsonrpc":"2.0","error":{"code":21474837103,"message":"kaboom"},"id":1})"};
+        200, {}, R"({"jsonrpc":"2.0","error":{"code":21474836983,"message":"kaboom"},"id":1})"};
     response.headers.Set("content-type", "application/json");
     return response;
   }
@@ -162,7 +165,7 @@ TEST(JsonRpc2InteropTest, ErrorCodesBeyondInt32AreNotTruncatedIntoTheHttpRange) 
   const auto divided = client->Divide(DivideInput{.dividend = 1, .divisor = 1});
   ASSERT_FALSE(divided.ok());
   EXPECT_EQ(divided.error().message(), "kaboom");
-  // 21474837103 truncated to int is 503 — which would classify as a
+  // 21474836983 truncated to int is 503 — which would classify as a
   // retryable server error. The full-width read lands in the 400 class.
   EXPECT_FALSE(divided.error().retryable());
 }

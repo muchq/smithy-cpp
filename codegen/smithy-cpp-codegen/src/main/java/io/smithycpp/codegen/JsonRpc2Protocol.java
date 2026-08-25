@@ -88,6 +88,9 @@ final class JsonRpc2Protocol implements ProtocolGenerator {
 
   @Override
   public void writeClientHelpers(CppWriter w, CppContext context) {
+    // ParseError declares a std::int64_t local; don't borrow <cstdint>
+    // transitively (SF.10).
+    w.addInclude("<cstdint>");
     ProtocolSupport.writeSanitizeErrorCode(w);
     ProtocolSupport.writeParsedErrorStruct(w);
     // jsonRpc2 error identity lives in the envelope's error object rather than

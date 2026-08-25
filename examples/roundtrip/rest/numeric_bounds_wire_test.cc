@@ -68,6 +68,12 @@ TEST(NumericBoundsSerdeTest, FloatEdgeAndNonFiniteValuesStillParse) {
   auto edge = DeserializeKitchenSink(SinkDoc("ratio", smithy::Document(float_max)));
   ASSERT_TRUE(edge.ok()) << edge.error().message();
   EXPECT_EQ(*edge->ratio, std::numeric_limits<float>::max());
+  // ...as is what a peer's shortest-round-trip printer (or our own
+  // FormatFloat) puts on the wire for float max — a double slightly above
+  // FLT_MAX that still rounds back to it.
+  auto shortest = DeserializeKitchenSink(SinkDoc("ratio", smithy::Document(3.4028235e38)));
+  ASSERT_TRUE(shortest.ok()) << shortest.error().message();
+  EXPECT_EQ(*shortest->ratio, std::numeric_limits<float>::max());
   // ...and the Smithy non-finite spellings narrow losslessly, never caught
   // in the overflow net.
   auto inf = DeserializeKitchenSink(SinkDoc("ratio", smithy::Document(std::string("-Infinity"))));
@@ -177,7 +183,12 @@ smithy::Outcome<DescribeSinkOutput> Describe(const std::string& body) {
   smithy::ClientConfig config;
   config.http_client = std::make_shared<CannedTransport>(body);
   auto client = RoundTripRestClient::Create(std::move(config));
-  EXPECT_TRUE(client.ok()) << client.error().message();
+  if (!client.ok()) {
+    // Not ASSERT (void-only): fail the test and hand back the creation
+    // error rather than dereferencing a failed Outcome.
+    ADD_FAILURE() << client.error().message();
+    return client.error();
+  }
   return client->DescribeSink(DescribeSinkInput{.sinkId = "s1"});
 }
 

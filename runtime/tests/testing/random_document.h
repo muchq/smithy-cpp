@@ -5,8 +5,10 @@
 #define SMITHY_TESTS_TESTING_RANDOM_DOCUMENT_H_
 
 #include <cstdint>
+#include <limits>
 #include <random>
 #include <string>
+#include <vector>
 
 #include "smithy/core/document.h"
 

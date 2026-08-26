@@ -12,6 +12,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -94,24 +95,28 @@ class ConsumerSocket final : public WebSocket, public std::enable_shared_from_th
   // thread racing the terminal transition — the executor-less shape. The
   // park generation settles the race exactly once under the lock, so a
   // stale deadline can never time out a later receive; the watchdog holds
-  // the socket alive (shared_from_this) for at most its own deadline.
+  // the socket alive (shared_from_this) for at most its own deadline, and
+  // it is spawned outside the lock so a park never stalls the session
+  // behind pthread_create.
   void ReceiveAsync(std::chrono::milliseconds timeout, ReceiveCallback callback) override {
     Outcome<std::optional<Message>> immediate = std::optional<Message>();  // the clean end
+    std::uint64_t parked_generation = 0;  // 0 = not parked (the counter starts at 1)
     {
       const std::lock_guard<std::mutex> lock(mutex_);
       if (!closed_ && !pending_receive_ && timeout > std::chrono::milliseconds::zero()) {
         pending_receive_ = std::move(callback);
-        ++receive_park_generation_;
-        ArmDeadlineLocked(timeout);
-        return;  // EndSession or the deadline completes it
-      }
-      if (!closed_ && pending_receive_) {
+        parked_generation = ++receive_park_generation_;
+      } else if (!closed_ && pending_receive_) {
         immediate = smithy::Error::Validation("consumer socket: a receive is already outstanding");
       } else if (!closed_) {
         // The non-positive poll — this peer never sends, so nothing is
         // ever already in hand.
         immediate = smithy::Error::Timeout("consumer socket: no message within the deadline");
       }
+    }
+    if (parked_generation != 0) {
+      ArmDeadline(parked_generation, timeout);  // EndSession or the deadline completes it
+      return;
     }
     callback(std::move(immediate));
   }
@@ -155,14 +160,19 @@ class ConsumerSocket final : public WebSocket, public std::enable_shared_from_th
   }
 
  private:
-  // With the lock held: arms the watchdog for the park that just went in.
-  // It sleeps on the shared condition variable, so a completed park
-  // (EndSession, or a fresh park's bumped generation) releases it early;
-  // at the deadline, a park still bearing its generation is timed out —
-  // the slot released exactly as a completion releases it.
-  void ArmDeadlineLocked(std::chrono::milliseconds timeout) {
-    std::thread([self = shared_from_this(), generation = receive_park_generation_,
-                 deadline = std::chrono::steady_clock::now() + timeout] {
+  // Arms the watchdog for the park `generation`. It sleeps on the shared
+  // condition variable, so a completed park (EndSession, or a fresh park's
+  // bumped generation) releases it early; at the deadline, a park still
+  // bearing its generation is timed out — the slot released exactly as a
+  // completion releases it. A spawn that fails must not leave the park
+  // unbounded: it is taken back (unless the session ended it first) and
+  // refused, keeping the callback exactly-once with nothing thrown at the
+  // caller. The saturation guards milliseconds::max()-style "practically
+  // forever" deadlines from overflowing into the past.
+  void ArmDeadline(std::uint64_t generation, std::chrono::milliseconds timeout) {
+    constexpr std::chrono::milliseconds kMaxWait = std::chrono::hours(24 * 365);
+    const auto deadline = std::chrono::steady_clock::now() + std::min(timeout, kMaxWait);
+    const auto watchdog = [self = shared_from_this(), generation, deadline] {
       ReceiveCallback expired;
       {
         std::unique_lock<std::mutex> lock(self->mutex_);
@@ -176,7 +186,21 @@ class ConsumerSocket final : public WebSocket, public std::enable_shared_from_th
         self->changed_.notify_all();
       }
       expired(smithy::Error::Timeout("consumer socket: no message within the deadline"));
-    }).detach();
+    };
+    ReceiveCallback refused;
+    try {
+      std::thread(watchdog).detach();
+      return;
+    } catch (...) {
+      const std::lock_guard<std::mutex> lock(mutex_);
+      if (pending_receive_ && receive_park_generation_ == generation) {
+        refused = std::exchange(pending_receive_, nullptr);
+        changed_.notify_all();
+      }
+    }
+    if (refused) {
+      refused(smithy::Error::Transport("consumer socket: cannot arm the receive deadline"));
+    }
   }
 
   std::mutex mutex_;

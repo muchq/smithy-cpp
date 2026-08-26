@@ -1,5 +1,6 @@
 #include "smithy/http/websocket_pair.h"
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <condition_variable>
@@ -197,6 +198,8 @@ class PairEnd final : public WebSocket {
                           WebSocket::ReceiveCallback callback) {
     WebSocket::SendCallback absorbed;
     Outcome<std::optional<eventstream::Message>> immediate = std::optional<eventstream::Message>();
+    // 0 = not parked (the generation counter starts at 1 on the first park).
+    std::uint64_t parked_generation = 0;
     {
       const std::lock_guard<std::mutex> lock(state_->mutex);
       if (state_->pending_receive[send_index_] || state_->blocked_receivers[send_index_] > 0) {
@@ -218,27 +221,33 @@ class PairEnd final : public WebSocket {
         immediate = Error::Timeout("websocket pair: no message within the receive deadline");
       } else {
         state_->pending_receive[send_index_] = std::move(callback);
-        ++state_->receive_park_generation[send_index_];
-        if (timeout.has_value()) {
-          ArmReceiveDeadlineLocked(*timeout);
-        }
-        return;  // a send, the deadline, or the close completes it
+        parked_generation = ++state_->receive_park_generation[send_index_];
       }
+    }
+    if (parked_generation != 0) {
+      // A send, the deadline, or the close completes the park.
+      if (timeout.has_value()) ArmReceiveDeadline(parked_generation, *timeout);
+      return;
     }
     if (absorbed) absorbed(Unit{});
     callback(std::move(immediate));
   }
 
-  // With the lock held: spawns the watchdog for the park that just went
-  // in. It sleeps on the shared condition variable, so a completed park
-  // (delivery, close, or a fresh park's bumped generation) releases it
-  // early; at the deadline, a park still bearing its generation is timed
-  // out — the slot is released exactly as a delivery releases it, and the
-  // session is untouched.
-  void ArmReceiveDeadlineLocked(std::chrono::milliseconds timeout) {
-    std::thread([state = state_, end = send_index_,
-                 generation = state_->receive_park_generation[send_index_],
-                 deadline = std::chrono::steady_clock::now() + timeout] {
+  // Spawns the watchdog for the park `generation` — outside the lock, so
+  // both ends' traffic never stalls behind pthread_create. It sleeps on
+  // the shared condition variable, so a completed park (delivery, close,
+  // or a fresh park's bumped generation) releases it early; at the
+  // deadline, a park still bearing its generation is timed out — the slot
+  // released exactly as a delivery releases it, the session untouched. A
+  // spawn that fails must not leave the park unbounded: the park is taken
+  // back (unless delivery already beat us to it) and refused, keeping the
+  // callback exactly-once with no exception escaping.
+  void ArmReceiveDeadline(std::uint64_t generation, std::chrono::milliseconds timeout) {
+    // Saturate far-future deadlines (milliseconds::max() as "practically
+    // forever") instead of overflowing now + timeout into the past.
+    constexpr std::chrono::milliseconds kMaxWait = std::chrono::hours(24 * 365);
+    const auto deadline = std::chrono::steady_clock::now() + std::min(timeout, kMaxWait);
+    const auto watchdog = [state = state_, end = send_index_, generation, deadline] {
       WebSocket::ReceiveCallback expired;
       {
         std::unique_lock<std::mutex> lock(state->mutex);
@@ -254,7 +263,29 @@ class PairEnd final : public WebSocket {
         state->changed.notify_all();
       }
       expired(Error::Timeout("websocket pair: no message within the receive deadline"));
-    }).detach();
+    };
+    // Under -fno-exceptions a failed thread spawn terminates (nothing can
+    // throw), which is the fail-fast posture; with exceptions on, contain
+    // it here so the caller never sees a throw beside a still-armed park.
+#if defined(__cpp_exceptions)
+    WebSocket::ReceiveCallback refused;
+    try {
+      std::thread(watchdog).detach();
+      return;
+    } catch (...) {
+      const std::lock_guard<std::mutex> lock(state_->mutex);
+      if (state_->pending_receive[send_index_] &&
+          state_->receive_park_generation[send_index_] == generation) {
+        refused = std::exchange(state_->pending_receive[send_index_], nullptr);
+        state_->changed.notify_all();
+      }
+    }
+    if (refused) {
+      refused(Error::Transport("websocket pair: cannot arm the receive deadline"));
+    }
+#else
+    std::thread(watchdog).detach();
+#endif
   }
 
   // Both receive overloads: `timeout` engaged bounds the wait, disengaged

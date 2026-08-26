@@ -207,8 +207,9 @@ class WebSocket {
   // slot is released exactly as a completed receive releases it — the next
   // receive (either API) may park again, and a message the wire delivers
   // after the deadline waits in the session for it. A non-positive timeout
-  // polls: it completes inline with what is already in hand, or with the
-  // timeout. The one-outstanding-receive rule is unchanged.
+  // polls: it completes without waiting — with what is already in hand
+  // (possibly on the completion context, like any ready result) or inline
+  // with the timeout. The one-outstanding-receive rule is unchanged.
   //
   // The timeout must race the completion and settle exactly once — the
   // implementation owns that race the same way it owns the parked slot

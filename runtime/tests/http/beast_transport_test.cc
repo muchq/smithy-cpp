@@ -1310,6 +1310,53 @@ TEST(BeastTransportTest, TheMetricsEndpointScrapesOverTheRealTransport) {
   server.Stop();
 }
 
+TEST(BeastTransportTest, AnOverLimitRejectionReachesTheMetricsScrape) {
+  // The gap RecordMetrics cannot close on its own: the transport writes this
+  // 413 before any handler chain exists, so middleware never sees it and an
+  // over-limit flood would be invisible in the request counters. Wiring
+  // on_rejected is what makes it visible, and only a real transport proves
+  // the wiring — the rejection has no in-process caller to fake.
+  auto metrics = std::make_shared<smithy::server::MetricsRegistry>();
+  BeastServerTransport server(BeastServerTransport::Options{
+      .max_body_bytes = 1024, .on_rejected = smithy::server::RecordRejections(metrics)});
+  ASSERT_TRUE(server
+                  .Start(smithy::server::Chain({smithy::server::MetricsEndpoint(metrics),
+                                                smithy::server::RecordMetrics(metrics)},
+                                               [](const HttpRequest&) {
+                                                 HttpResponse response;
+                                                 response.status = 200;
+                                                 response.operation = "GetThing";
+                                                 return response;
+                                               }))
+                  .ok());
+
+  SocketHttpClient client("127.0.0.1", server.port());
+  HttpRequest oversized;
+  oversized.method = "POST";
+  oversized.target = "/upload";
+  oversized.body = std::string(64 * 1024, 'x');
+  const auto rejected = client.Send(oversized);
+  ASSERT_TRUE(rejected.ok()) << rejected.error().message();
+  ASSERT_EQ(rejected->status, 413);
+
+  const std::string scrape =
+      RawRoundTrip(server.port(), "GET /metrics HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n");
+  const auto header_end = scrape.find("\r\n\r\n");
+  ASSERT_NE(header_end, std::string::npos) << scrape;
+  const std::string body = scrape.substr(header_end + 4);
+  EXPECT_NE(body.find(R"(smithy_http_requests_total{method="POST",operation="",status="413"} 1)"),
+            std::string::npos)
+      << body;
+  // Counted, but not filed as a latency observation: a request refused at
+  // parse time has no service latency, and zeros here would flatter the
+  // panel during exactly the flood it should expose.
+  EXPECT_EQ(body.find(R"(smithy_http_request_duration_seconds_count{method="POST",operation=""})"),
+            std::string::npos)
+      << body;
+
+  server.Stop();
+}
+
 TEST(BeastTransportTest, TheMetricsEndpointsHeadReportsTheGetsLength) {
   // Same framing hazard as the health endpoint below: MetricsEndpoint answers
   // HEAD itself, so it is on the handler to hand the transport a full body

@@ -12,6 +12,7 @@
 #include <utility>
 #include <vector>
 
+#include "smithy/core/fatal.h"
 #include "smithy/server/middleware.h"
 
 namespace smithy::server {
@@ -223,6 +224,27 @@ class MetricsRegistry {
   // without it the gauge stays at zero and the other families are unaffected.
   void RecordStart(const RequestStart& start);
 
+  // Counts a request the transport rejected before any handler chain ran —
+  // the 413/431 an over-limit body or header set earns while the parser is
+  // still reading. RecordMetrics cannot see these: it is middleware, and the
+  // transport answers these before middleware exists, so without this an
+  // over-limit flood is invisible in the request counters entirely.
+  //
+  // It counts and nothing more. The in-flight gauge never moves, because
+  // such a request was never in flight through a handler; and no latency is
+  // filed, because a request refused at parse time has no service latency to
+  // report. Filing it as a zero observation would be worse than filing
+  // nothing: a flood of them drags `rate(_sum)/rate(_count)` toward zero, so
+  // the latency panel would look its best exactly while the service is being
+  // hammered.
+  //
+  // `method` is whatever the parser had reached — normalized like every
+  // other method label, and empty becomes "unparsed" rather than "other",
+  // since a 431 can fire mid-headers and "never parsed" is a different
+  // diagnosis from "invented verb". The rejected target is deliberately
+  // dropped: a flood against distinct paths must not mint a series each.
+  void RecordRejection(std::string_view method, int status);
+
   // Mints an application metric family. The name must be a valid Prometheus
   // metric name, and must not collide with a family already registered (the
   // built-ins included) under a different type or help text — both abort at
@@ -289,6 +311,22 @@ class MetricsRegistry {
 // registry aborts at composition time (ADR-0009) — a metrics endpoint that
 // silently reports nothing is worse than one that never starts.
 Middleware RecordMetrics(std::shared_ptr<MetricsRegistry> registry);
+
+// A ready-made sink for `BeastServerTransport::Options::on_rejected`:
+//
+//   options.on_rejected = smithy::server::RecordRejections(metrics);
+//
+// Generic in the rejection type so this header — and `:server` with it —
+// keeps no dependency on the Beast transport that defines it. A null
+// registry aborts (ADR-0009).
+inline auto RecordRejections(std::shared_ptr<MetricsRegistry> registry) {
+  if (registry == nullptr) {
+    smithy::internal::Fatal("smithy::server::RecordRejections: registry may not be null");
+  }
+  return [registry = std::move(registry)](const auto& rejected) {
+    registry->RecordRejection(rejected.method, rejected.status);
+  };
+}
 
 // The serving half: answers GET or HEAD <path> (query string ignored) with
 // the registry's exposition; every other request passes through to the next

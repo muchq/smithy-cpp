@@ -28,7 +28,10 @@ policy in [docs/versioning.md](docs/versioning.md).
   Prometheus target covers the service; the registry keeps owning escaping,
   label ordering, and the per-family cap. `Declare` exports a known series at
   zero from startup, so the first event is a visible step rather than a
-  counter's invisible first sample. See the Observability section of
+  counter's invisible first sample. `RecordRejections` feeds
+  `BeastServerTransport::Options::on_rejected`, so the 413/431 the transport
+  writes before any middleware exists are counted too — without filing a
+  zero latency that would flatter the panel during an over-limit flood. See the Observability section of
   [docs/production-guide.md](docs/production-guide.md).
 
 ### Fixed

@@ -279,6 +279,23 @@ void MetricsRegistry::Record(const RequestObservation& observation) {
   }
 }
 
+void MetricsRegistry::RecordRejection(std::string_view method, int status) {
+  // "unparsed" rather than "other": a 431 can fire before the method token
+  // was ever read, and that is a different diagnosis from a client inventing
+  // a verb. Both are bounded, which is what the label set needs.
+  const CountKey key{.method = method.empty() ? "unparsed" : std::string(NormalizeMethod(method)),
+                     .operation = "",
+                     .status = status};
+  const std::lock_guard<std::mutex> lock(mutex_);
+  if (auto found = counts_.find(key); found != counts_.end()) {
+    ++found->second;
+  } else if (counts_.size() < max_series_) {
+    counts_.emplace(key, 1);
+  } else {
+    ++observations_dropped_;
+  }
+}
+
 std::shared_ptr<internal::MetricFamily> MetricsRegistry::Register(std::string name,
                                                                   std::string help,
                                                                   internal::MetricFamily::Kind kind,

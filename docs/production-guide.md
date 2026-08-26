@@ -443,6 +443,24 @@ collides with an existing family under a different type, aborts at
 registration: both produce a scrape Prometheus rejects in full, and nothing
 in-process would notice.
 
+One more hook is worth wiring, because middleware cannot reach it. The
+transport answers over-limit requests (413/431) itself, while the parser is
+still reading and before any handler chain exists — so `RecordMetrics` never
+sees them and an over-limit flood would be invisible in the counters:
+
+```cpp
+options.on_rejected = smithy::server::RecordRejections(metrics);
+```
+
+These count as requests (`operation=""`, with `413`/`431` as the signature)
+but file no latency and never move the in-flight gauge: a request refused at
+parse time has no service latency to report, and recording it as a zero
+observation would drag `rate(_sum)/rate(_count)` down — flattering the
+latency panel during exactly the flood it should be exposing. A method that
+never parsed (a 431 can fire mid-headers) is labeled `unparsed` rather than
+`other`, since "never parsed" and "client invented a verb" are different
+diagnoses.
+
 The endpoint is unauthenticated: it is middleware, so gate it the way you
 gate anything else — compose `Guard` or `RequireBearerAuth` outside it, or
 bind the scrape listener somewhere the internet cannot reach.

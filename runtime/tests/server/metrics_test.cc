@@ -242,6 +242,88 @@ TEST(MetricsRegistryTest, CompletionsWithoutStartsLeaveTheGaugeAtZero) {
 }
 
 // ---------------------------------------------------------------------------
+// Transport rejections: the 413/431 written before any middleware exists.
+// ---------------------------------------------------------------------------
+
+TEST(MetricsRegistryTest, ARejectionIsCountedLikeAnyOtherServedRequest) {
+  // Without this an over-limit flood is invisible in the counters: the
+  // transport answers these before the handler chain RecordMetrics wraps.
+  MetricsRegistry registry;
+  registry.RecordRejection("POST", 413);
+  registry.RecordRejection("POST", 413);
+  EXPECT_TRUE(HasLine(registry.Expose(),
+                      R"(smithy_http_requests_total{method="POST",operation="",status="413"} 2)"))
+      << registry.Expose();
+}
+
+TEST(MetricsRegistryTest, ARejectionBeforeTheMethodParsedIsNotAnInventedVerb) {
+  // A 431 can fire mid-headers, before the method token was read. "never
+  // parsed" and "client invented a verb" are different diagnoses, so they
+  // must not share the "other" bucket.
+  MetricsRegistry registry;
+  registry.RecordRejection("", 431);
+  registry.RecordRejection("BREW", 431);
+  const std::string exposition = registry.Expose();
+  EXPECT_TRUE(HasLine(
+      exposition, R"(smithy_http_requests_total{method="unparsed",operation="",status="431"} 1)"))
+      << exposition;
+  EXPECT_TRUE(HasLine(exposition,
+                      R"(smithy_http_requests_total{method="other",operation="",status="431"} 1)"))
+      << exposition;
+}
+
+TEST(MetricsRegistryTest, ARejectionFilesNoLatencyAndMovesNoGauge) {
+  // The improvement over recording a zero observation: a request refused at
+  // parse time has no service latency, and a flood of zeros would drag
+  // rate(_sum)/rate(_count) down — making the latency panel look its best
+  // exactly while the service is being hammered. It was also never in
+  // flight through a handler, so the gauge must not move either.
+  MetricsRegistry registry;
+  registry.Record(Served("POST", "AddThing", 200, microseconds(200000)));  // 0.2s
+  for (int i = 0; i < 50; ++i) {
+    registry.RecordRejection("POST", 413);
+  }
+
+  const std::string exposition = registry.Expose();
+  // One real observation, and the mean is still that observation.
+  EXPECT_TRUE(HasLine(
+      exposition,
+      R"(smithy_http_request_duration_seconds_count{method="POST",operation="AddThing"} 1)"))
+      << exposition;
+  EXPECT_TRUE(HasLine(
+      exposition,
+      R"(smithy_http_request_duration_seconds_sum{method="POST",operation="AddThing"} 0.2)"))
+      << exposition;
+  // No latency series was minted for the rejections at all.
+  EXPECT_EQ(
+      exposition.find(R"(smithy_http_request_duration_seconds_count{method="POST",operation=""})"),
+      std::string::npos)
+      << exposition;
+  EXPECT_TRUE(HasLine(exposition, "smithy_http_requests_in_flight 0")) << exposition;
+}
+
+TEST(MetricsRegistryTest, TheRejectionSinkFeedsTheRegistry) {
+  // The shape a consumer wires into BeastServerTransport::Options, checked
+  // against a stand-in with the same fields — :server keeps no Beast dep.
+  struct Rejected {
+    int status = 0;
+    std::string peer_address{};
+    std::string method{};
+    std::string target{};
+  };
+  auto registry = std::make_shared<MetricsRegistry>();
+  auto sink = RecordRejections(registry);
+  sink(Rejected{.status = 413, .method = "PUT", .target = "/upload/8f3a2b"});
+
+  const std::string exposition = registry->Expose();
+  EXPECT_TRUE(HasLine(exposition,
+                      R"(smithy_http_requests_total{method="PUT",operation="",status="413"} 1)"))
+      << exposition;
+  // The target is dropped: a flood against distinct paths mints no series.
+  EXPECT_EQ(exposition.find("8f3a2b"), std::string::npos) << exposition;
+}
+
+// ---------------------------------------------------------------------------
 // Application metrics.
 // ---------------------------------------------------------------------------
 

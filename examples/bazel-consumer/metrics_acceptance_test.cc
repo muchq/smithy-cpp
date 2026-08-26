@@ -33,10 +33,23 @@ using acme::todo::TodoClient;
 using acme::todo::TodoHandler;
 using acme::todo::TodoServer;
 
+// A handler that emits its own domain metrics alongside the built-in HTTP
+// families — the reason MetricsRegistry hands out typed families rather than
+// only serving what Observe feeds it. The handles are minted once and held;
+// they are cheap to copy and address the same family.
 class MetricsHandler final : public TodoHandler {
  public:
+  explicit MetricsHandler(const std::shared_ptr<smithy::server::MetricsRegistry>& metrics)
+      : tasks_added_(metrics->NewCounter("todo_tasks_added_total", "Tasks added, by priority.")),
+        title_length_(metrics->NewHistogram("todo_title_length_chars", "Task title length.",
+                                            {8.0, 32.0, 128.0})),
+        tasks_stored_(metrics->NewGauge("todo_tasks_stored", "Tasks currently stored.")) {}
+
   smithy::Outcome<AddTaskOutput> AddTask(const AddTaskInput& input,
                                          const smithy::server::RequestContext&) override {
+    tasks_added_.Increment({{"priority", input.priority.has_value() ? "set" : "unset"}});
+    title_length_.Observe(static_cast<double>(input.title.size()));
+    tasks_stored_.Increment();
     return AddTaskOutput{.taskId = "task-1", .title = input.title};
   }
 
@@ -46,13 +59,18 @@ class MetricsHandler final : public TodoHandler {
     error.set_detail(NoSuchTask{.message = "no task: " + input.taskId});
     return error;
   }
+
+ private:
+  smithy::server::Counter tasks_added_;
+  smithy::server::Histogram title_length_;
+  smithy::server::Gauge tasks_stored_;
 };
 
 class MetricsAcceptanceTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    server_ = std::make_unique<TodoServer>(std::make_shared<MetricsHandler>());
     metrics_ = std::make_shared<smithy::server::MetricsRegistry>();
+    server_ = std::make_unique<TodoServer>(std::make_shared<MetricsHandler>(metrics_));
     transport_ = std::make_unique<smithy::http::BeastServerTransport>(
         smithy::http::BeastServerTransport::Options{.threads = 1, .handler_threads = 4});
     // The composition the production guide documents, assembled here in
@@ -157,6 +175,36 @@ TEST_F(MetricsAcceptanceTest, AnUnroutedRequestCountsWithAnEmptyOperation) {
       << body;
   EXPECT_EQ(body.find("8f3a2b"), std::string::npos)
       << "the request target leaked into a label: " << body;
+}
+
+TEST_F(MetricsAcceptanceTest, ApplicationMetricsShareTheEndpointWithTheBuiltIns) {
+  // What a consumer actually wants from a metrics endpoint: its own domain
+  // numbers on the same scrape as the HTTP families, so one Prometheus target
+  // covers the service. The handler minted these from the same registry the
+  // middleware serves.
+  ASSERT_TRUE(client_->AddTask(AddTaskInput{.title = "short"}).ok());
+  ASSERT_TRUE(client_
+                  ->AddTask(AddTaskInput{.title = "a considerably longer task title",
+                                         .priority = acme::todo::Priority::kHigh})
+                  .ok());
+
+  const auto scrape = Scrape();
+  ASSERT_TRUE(scrape.ok()) << scrape.error().message();
+  const std::string& body = scrape->body;
+
+  EXPECT_NE(body.find("# TYPE todo_tasks_added_total counter"), std::string::npos) << body;
+  EXPECT_NE(body.find(R"(todo_tasks_added_total{priority="unset"} 1)"), std::string::npos) << body;
+  EXPECT_NE(body.find(R"(todo_tasks_added_total{priority="set"} 1)"), std::string::npos) << body;
+
+  EXPECT_NE(body.find("# TYPE todo_title_length_chars histogram"), std::string::npos) << body;
+  EXPECT_NE(body.find(R"(todo_title_length_chars_bucket{le="8"} 1)"), std::string::npos) << body;
+  EXPECT_NE(body.find("todo_title_length_chars_count 2"), std::string::npos) << body;
+
+  EXPECT_NE(body.find("# TYPE todo_tasks_stored gauge"), std::string::npos) << body;
+  EXPECT_NE(body.find("todo_tasks_stored 2"), std::string::npos) << body;
+
+  // Still one scrape: the built-in families are unaffected by the additions.
+  EXPECT_NE(body.find(R"(operation="AddTask")"), std::string::npos) << body;
 }
 
 }  // namespace

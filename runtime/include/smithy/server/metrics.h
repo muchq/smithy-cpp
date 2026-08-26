@@ -9,6 +9,7 @@
 #include <mutex>
 #include <string>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 #include "smithy/server/middleware.h"
@@ -43,6 +44,9 @@ namespace smithy::server {
 // Status is the exact code rather than a class: it is bounded either way,
 // and `{status=~"5.."}` recovers the class at query time while the reverse
 // direction loses information that matters at 3am.
+//
+// Application metrics join the same scrape through NewCounter / NewGauge /
+// NewHistogram; see MetricsRegistry below.
 
 // The bucket boundaries of `smithy_http_request_duration_seconds`, in
 // seconds — Prometheus's own default ladder, which is tuned for exactly this
@@ -52,6 +56,92 @@ inline const std::vector<double>& DefaultLatencyBuckets() {
                                                0.5,   1.0,  2.5,   5.0,  10.0};
   return kBuckets;
 }
+
+// The labels of one application-metric sample. Names are code constants and
+// are validated (an invalid one aborts, ADR-0009 — it would otherwise emit a
+// scrape Prometheus rejects wholesale); values are data and are escaped.
+// Order does not matter: labels are sorted by name, so {a,b} and {b,a} are
+// the same series rather than two.
+using MetricLabels = std::vector<std::pair<std::string, std::string>>;
+
+namespace internal {
+
+// One application-metric family: its identity, and every sample under it
+// keyed by rendered label text. Held by shared_ptr so a handle that outlives
+// its registry updates a family nobody exposes rather than dangling.
+struct MetricFamily {
+  enum class Kind { kCounter, kGauge, kHistogram };
+
+  struct Sample {
+    // Counter/gauge value, or the histogram's running sum.
+    double value = 0.0;
+    // Histogram only: observation count and per-bucket counts, parallel to
+    // `buckets` and accumulated into cumulative form at exposition time.
+    std::uint64_t count = 0;
+    std::vector<std::uint64_t> bucket_counts{};
+  };
+
+  std::string name;
+  std::string help;
+  Kind kind = Kind::kCounter;
+  std::vector<double> buckets;
+  std::size_t max_series = 0;
+
+  mutable std::mutex mutex;
+  std::map<std::string, Sample> samples;
+  std::uint64_t dropped = 0;
+
+  // `set` replaces the value (a gauge Set); otherwise it adds to it.
+  void Add(const MetricLabels& labels, double amount, bool set);
+  void Observe(const MetricLabels& labels, double value);
+};
+
+}  // namespace internal
+
+// A monotonically increasing count. Cheap to copy; every copy addresses the
+// same family.
+class Counter {
+ public:
+  void Increment(double amount = 1.0) { Increment(MetricLabels{}, amount); }
+  void Increment(const MetricLabels& labels, double amount = 1.0) {
+    family_->Add(labels, amount, /*set=*/false);
+  }
+
+ private:
+  friend class MetricsRegistry;
+  explicit Counter(std::shared_ptr<internal::MetricFamily> family) : family_(std::move(family)) {}
+  std::shared_ptr<internal::MetricFamily> family_;
+};
+
+// A value that goes up and down.
+class Gauge {
+ public:
+  void Set(double value) { Set(MetricLabels{}, value); }
+  void Set(const MetricLabels& labels, double value) { family_->Add(labels, value, /*set=*/true); }
+  void Increment(double amount = 1.0) { Increment(MetricLabels{}, amount); }
+  void Increment(const MetricLabels& labels, double amount = 1.0) {
+    family_->Add(labels, amount, /*set=*/false);
+  }
+  void Decrement(double amount = 1.0) { Increment(MetricLabels{}, -amount); }
+  void Decrement(const MetricLabels& labels, double amount = 1.0) { Increment(labels, -amount); }
+
+ private:
+  friend class MetricsRegistry;
+  explicit Gauge(std::shared_ptr<internal::MetricFamily> family) : family_(std::move(family)) {}
+  std::shared_ptr<internal::MetricFamily> family_;
+};
+
+// A distribution over configured buckets, exposed with _bucket/_sum/_count.
+class Histogram {
+ public:
+  void Observe(double value) { Observe(MetricLabels{}, value); }
+  void Observe(const MetricLabels& labels, double value) { family_->Observe(labels, value); }
+
+ private:
+  friend class MetricsRegistry;
+  explicit Histogram(std::shared_ptr<internal::MetricFamily> family) : family_(std::move(family)) {}
+  std::shared_ptr<internal::MetricFamily> family_;
+};
 
 // A thread-safe aggregate of served requests, exposable as Prometheus text.
 //
@@ -69,14 +159,26 @@ inline const std::vector<double>& DefaultLatencyBuckets() {
 //     minting a series per invented verb.
 //   - Past `max_series` distinct label combinations the registry stops
 //     minting new ones and counts each refused observation once in
-//     `smithy_metrics_observations_dropped_total`. With the two rules above the
-//     cap should be unreachable; it is the backstop for a handler that
+//     `smithy_metrics_observations_dropped_total`. With the two rules above
+//     the cap should be unreachable; it is the backstop for a handler that
 //     stamps its own unbounded operation, and it fails visibly (a counter
 //     you can alert on) rather than by exhausting memory.
+//
+// Application metrics share the same scrape and the same protections. Mint a
+// family once, keep the handle, and use it from anywhere:
+//
+//   auto orders = metrics->NewCounter("orders_processed_total",
+//                                     "Orders processed.");
+//   orders.Increment({{"region", "us-east"}});
+//
+// The cap applies per family, so a label chosen from unbounded data (a user
+// id, an order id) costs that family its own series budget and shows up in
+// the dropped counter — it cannot take the process down with it.
 class MetricsRegistry {
  public:
   // max_series bounds the distinct {method,operation,status} and
-  // {method,operation} combinations retained; see the cardinality note above.
+  // {method,operation} combinations retained, and separately the series of
+  // each application family; see the cardinality note above.
   explicit MetricsRegistry(std::size_t max_series = 4096,
                            std::vector<double> latency_buckets = DefaultLatencyBuckets());
 
@@ -88,10 +190,27 @@ class MetricsRegistry {
   // without it the gauge stays at zero and the other families are unaffected.
   void RecordStart(const RequestStart& start);
 
+  // Mints an application metric family. The name must be a valid Prometheus
+  // metric name, and must not collide with a family already registered (the
+  // built-ins included) under a different type or help text — both abort at
+  // registration (ADR-0009), because either produces a scrape Prometheus
+  // rejects in full, and a metrics endpoint has no in-process consumer to
+  // notice. Re-minting the same name with the same type and help returns a
+  // handle to the same family, so a helper can hand one out repeatedly
+  // without callers coordinating.
+  Counter NewCounter(std::string name, std::string help);
+  Gauge NewGauge(std::string name, std::string help);
+  Histogram NewHistogram(std::string name, std::string help,
+                         std::vector<double> buckets = DefaultLatencyBuckets());
+
   // The Prometheus text exposition format (version 0.0.4), ready to serve.
   std::string Expose() const;
 
  private:
+  std::shared_ptr<internal::MetricFamily> Register(std::string name, std::string help,
+                                                   internal::MetricFamily::Kind kind,
+                                                   std::vector<double> buckets);
+
   struct CountKey {
     std::string method;
     std::string operation;
@@ -114,8 +233,8 @@ class MetricsRegistry {
   // One histogram: per-bucket counts (parallel to buckets_, non-cumulative
   // here and accumulated at exposition time) plus the sum and count the
   // format also carries.
-  struct Histogram {
-    std::vector<std::uint64_t> counts;
+  struct HistogramData {
+    std::vector<std::uint64_t> counts{};
     double sum_seconds = 0.0;
     std::uint64_t count = 0;
   };
@@ -124,9 +243,11 @@ class MetricsRegistry {
   std::size_t max_series_;
   std::vector<double> buckets_;
   std::map<CountKey, std::uint64_t> counts_;
-  std::map<LatencyKey, Histogram> latencies_;
+  std::map<LatencyKey, HistogramData> latencies_;
   std::int64_t in_flight_ = 0;
   std::uint64_t observations_dropped_ = 0;
+  // Sorted by name so each family's samples stay contiguous in the output.
+  std::map<std::string, std::shared_ptr<internal::MetricFamily>> families_;
 };
 
 // The recording half: Observe wired to `registry`. Implemented in terms of

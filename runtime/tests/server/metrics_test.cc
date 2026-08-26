@@ -242,6 +242,131 @@ TEST(MetricsRegistryTest, CompletionsWithoutStartsLeaveTheGaugeAtZero) {
 }
 
 // ---------------------------------------------------------------------------
+// Application metrics.
+// ---------------------------------------------------------------------------
+
+TEST(MetricsRegistryTest, ACustomCounterJoinsTheSameScrape) {
+  MetricsRegistry registry;
+  auto orders = registry.NewCounter("orders_processed_total", "Orders processed.");
+  orders.Increment();
+  orders.Increment({{"region", "us-east"}}, 4);
+
+  const std::string exposition = registry.Expose();
+  EXPECT_TRUE(HasLine(exposition, "# HELP orders_processed_total Orders processed.")) << exposition;
+  EXPECT_TRUE(HasLine(exposition, "# TYPE orders_processed_total counter")) << exposition;
+  EXPECT_TRUE(HasLine(exposition, "orders_processed_total 1")) << exposition;
+  EXPECT_TRUE(HasLine(exposition, R"(orders_processed_total{region="us-east"} 4)")) << exposition;
+  // The built-in families are still there, whole.
+  EXPECT_TRUE(HasLine(exposition, "# TYPE smithy_http_requests_total counter")) << exposition;
+}
+
+TEST(MetricsRegistryTest, AGaugeGoesUpAndDown) {
+  MetricsRegistry registry;
+  auto depth = registry.NewGauge("queue_depth", "Pending jobs.");
+  depth.Set(10);
+  depth.Increment(5);
+  depth.Decrement(3);
+  EXPECT_TRUE(HasLine(registry.Expose(), "queue_depth 12")) << registry.Expose();
+}
+
+TEST(MetricsRegistryTest, ACustomHistogramExposesBucketsSumAndCount) {
+  MetricsRegistry registry;
+  auto sizes = registry.NewHistogram("batch_size", "Rows per batch.", {10.0, 100.0});
+  sizes.Observe(5);
+  sizes.Observe(50);
+  sizes.Observe(500);
+
+  const std::string exposition = registry.Expose();
+  EXPECT_TRUE(HasLine(exposition, R"(batch_size_bucket{le="10"} 1)")) << exposition;
+  EXPECT_TRUE(HasLine(exposition, R"(batch_size_bucket{le="100"} 2)")) << exposition;
+  EXPECT_TRUE(HasLine(exposition, R"(batch_size_bucket{le="+Inf"} 3)")) << exposition;
+  EXPECT_TRUE(HasLine(exposition, "batch_size_sum 555")) << exposition;
+  EXPECT_TRUE(HasLine(exposition, "batch_size_count 3")) << exposition;
+}
+
+TEST(MetricsRegistryTest, LabelOrderDoesNotSplitASeries) {
+  // Sorting by name is what keeps {a,b} and {b,a} one series; without it a
+  // caller that swapped two labels would silently double-count.
+  MetricsRegistry registry;
+  auto hits = registry.NewCounter("cache_hits_total", "Cache hits.");
+  hits.Increment({{"tier", "hot"}, {"region", "eu"}});
+  hits.Increment({{"region", "eu"}, {"tier", "hot"}});
+  EXPECT_TRUE(HasLine(registry.Expose(), R"(cache_hits_total{region="eu",tier="hot"} 2)"))
+      << registry.Expose();
+}
+
+TEST(MetricsRegistryTest, ACustomLabelValueIsEscaped) {
+  // All three the exposition format requires: quote, backslash, newline. An
+  // unescaped one corrupts the whole scrape, not just this line.
+  MetricsRegistry registry;
+  auto errors = registry.NewCounter("job_errors_total", "Job errors.");
+  errors.Increment({{"reason", "quote\" back\\slash\nnewline"}});
+  EXPECT_TRUE(
+      HasLine(registry.Expose(), R"(job_errors_total{reason="quote\" back\\slash\nnewline"} 1)"))
+      << registry.Expose();
+}
+
+TEST(MetricsRegistryTest, AnUnboundedCustomLabelIsCappedAndAttributed) {
+  // The whole point of the per-family cap: a label taken from unbounded data
+  // costs that family its budget and says so, instead of the process.
+  MetricsRegistry registry(/*max_series=*/4);
+  auto seen = registry.NewCounter("user_events_total", "User events.");
+  for (int i = 0; i < 50; ++i) {
+    seen.Increment({{"user_id", std::to_string(i)}});
+  }
+  const std::string exposition = registry.Expose();
+  EXPECT_EQ(exposition.find(R"(user_id="49")"), std::string::npos) << exposition;
+  EXPECT_TRUE(HasLine(
+      exposition, R"(smithy_metrics_observations_dropped_total{metric="user_events_total"} 46)"))
+      << exposition;
+}
+
+TEST(MetricsRegistryTest, ReMintingTheSameFamilyReturnsTheSameSeries) {
+  // A helper handing out a handle repeatedly must not fork the family.
+  MetricsRegistry registry;
+  auto first = registry.NewCounter("widgets_total", "Widgets.");
+  auto second = registry.NewCounter("widgets_total", "Widgets.");
+  first.Increment();
+  second.Increment();
+  EXPECT_TRUE(HasLine(registry.Expose(), "widgets_total 2")) << registry.Expose();
+}
+
+TEST(MetricsRegistryDeathTest, RegisteringAnInvalidOrCollidingNameAborts) {
+  // Each of these emits a scrape Prometheus rejects in full, and nothing
+  // in-process would notice — so they fail at registration (ADR-0009).
+  EXPECT_DEATH(
+      { MetricsRegistry().NewCounter("bad-name", "Dashes are not name characters."); }, "");
+  EXPECT_DEATH(
+      { MetricsRegistry().NewCounter("smithy_http_requests_total", "Shadows a built-in."); }, "");
+  EXPECT_DEATH(
+      {
+        MetricsRegistry registry;
+        registry.NewCounter("thing_total", "One help string.");
+        registry.NewGauge("thing_total", "One help string.");
+      },
+      "");
+}
+
+TEST(MetricsRegistryDeathTest, AnInvalidLabelNameAborts) {
+  EXPECT_DEATH(
+      {
+        MetricsRegistry registry;
+        registry.NewCounter("things_total", "Things.").Increment({{"not a name", "v"}});
+      },
+      "");
+}
+
+TEST(MetricsRegistryTest, AHandleOutlivingItsRegistryIsInert) {
+  // Handles share ownership of the family, so a stray one left in a
+  // long-lived lambda updates something nobody exposes rather than dangling.
+  Counter orphan = [] {
+    MetricsRegistry registry;
+    return registry.NewCounter("orphan_total", "Orphaned.");
+  }();
+  orphan.Increment();  // must not crash under ASan
+}
+
+// ---------------------------------------------------------------------------
 // The composed middleware.
 // ---------------------------------------------------------------------------
 

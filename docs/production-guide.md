@@ -404,6 +404,32 @@ invented verb. Past `max_series` combinations the registry stops minting and
 counts what it refused in `smithy_metrics_observations_dropped_total` — alert on
 that being non-zero rather than discovering the cap as an OOM.
 
+Your own metrics share the same scrape — one Prometheus target covers the
+service, rather than the built-in families sitting behind one endpoint and
+your domain numbers behind another. Mint a family once and keep the handle:
+
+```cpp
+auto orders = metrics->NewCounter("orders_processed_total", "Orders processed.");
+auto latency = metrics->NewHistogram("order_pipeline_seconds", "Pipeline time.");
+auto depth = metrics->NewGauge("queue_depth", "Pending jobs.");
+
+orders.Increment({{"region", "us-east"}});
+latency.Observe(elapsed.count());
+depth.Set(pending);
+```
+
+Handles are cheap to copy and address the same family, so a handler can hold
+them as members. The registry keeps owning the parts that are easy to get
+wrong: label values are escaped, labels are sorted so `{a,b}` and `{b,a}` are
+one series rather than two, and the same per-family cap applies — a label
+taken from unbounded data (a user id) costs that family its series budget and
+is attributed on
+`smithy_metrics_observations_dropped_total{metric="..."}` instead of taking
+the process down. A metric name that isn't a valid Prometheus name, or that
+collides with an existing family under a different type, aborts at
+registration: both produce a scrape Prometheus rejects in full, and nothing
+in-process would notice.
+
 The endpoint is unauthenticated: it is middleware, so gate it the way you
 gate anything else — compose `Guard` or `RequireBearerAuth` outside it, or
 bind the scrape listener somewhere the internet cannot reach.

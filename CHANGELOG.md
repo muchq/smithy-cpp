@@ -23,7 +23,10 @@ policy in [docs/versioning.md](docs/versioning.md).
   query strings would mint a series per request id), an off-wire `method`
   outside the standard set collapses to `other`, and a series cap backstops
   anything unforeseen while counting what it refused in
-  `smithy_metrics_observations_dropped_total`. See the Observability section of
+  `smithy_metrics_observations_dropped_total`. Application metrics join the
+  same scrape through `NewCounter` / `NewGauge` / `NewHistogram`, so one
+  Prometheus target covers the service; the registry keeps owning escaping,
+  label ordering, and the per-family cap. See the Observability section of
   [docs/production-guide.md](docs/production-guide.md).
 
 ### Fixed

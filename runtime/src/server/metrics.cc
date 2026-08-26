@@ -74,6 +74,57 @@ std::string FormatNumber(double value) {
   return text.empty() ? "0" : text;
 }
 
+// Prometheus metric names are [a-zA-Z_:][a-zA-Z0-9_:]*, label names the same
+// without the colon. Both are code constants here, so an invalid one is a
+// programming error caught on the first run rather than data to sanitize —
+// and letting one through corrupts the whole scrape, not just its own line.
+bool ValidName(std::string_view name, bool allow_colon) {
+  if (name.empty()) return false;
+  const auto valid = [allow_colon](char c, bool first) {
+    if (c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) return true;
+    if (allow_colon && c == ':') return true;
+    return !first && c >= '0' && c <= '9';
+  };
+  if (!valid(name.front(), true)) return false;
+  return std::ranges::all_of(name.substr(1), [&](char c) { return valid(c, false); });
+}
+
+// Renders a label set into the inner text of `{...}`, sorted by name so the
+// same labels in a different order address the same series instead of
+// silently minting a second one.
+std::string RenderLabels(const MetricLabels& labels) {
+  std::vector<std::pair<std::string, std::string>> sorted(labels.begin(), labels.end());
+  std::ranges::sort(sorted, [](const auto& a, const auto& b) { return a.first < b.first; });
+  std::string out;
+  for (const auto& [name, value] : sorted) {
+    if (!ValidName(name, /*allow_colon=*/false)) {
+      smithy::internal::Fatal("smithy::server::MetricsRegistry: invalid label name '" + name + "'");
+    }
+    if (!out.empty()) out += ',';
+    out += name;
+    out += "=\"";
+    out += EscapeLabel(value);
+    out += '"';
+  }
+  return out;
+}
+
+// Appends `<name><suffix>{labels} <value>` and a newline, omitting the braces
+// when the sample carries no labels.
+void AppendSample(std::string& out, std::string_view name, std::string_view suffix,
+                  std::string_view labels, std::string_view value) {
+  out += name;
+  out += suffix;
+  if (!labels.empty()) {
+    out += '{';
+    out += labels;
+    out += '}';
+  }
+  out += ' ';
+  out += value;
+  out += '\n';
+}
+
 void AppendFamilyHeader(std::string& out, std::string_view name, std::string_view type,
                         std::string_view help) {
   out += "# HELP ";
@@ -88,6 +139,50 @@ void AppendFamilyHeader(std::string& out, std::string_view name, std::string_vie
 }
 
 }  // namespace
+
+namespace internal {
+
+void MetricFamily::Add(const MetricLabels& labels, double amount, bool set) {
+  const std::string key = RenderLabels(labels);
+  const std::lock_guard<std::mutex> lock(mutex);
+  if (auto found = samples.find(key); found != samples.end()) {
+    if (set) {
+      found->second.value = amount;
+    } else {
+      found->second.value += amount;
+    }
+    return;
+  }
+  if (samples.size() >= max_series) {
+    ++dropped;
+    return;
+  }
+  samples.emplace(key, Sample{.value = amount});
+}
+
+void MetricFamily::Observe(const MetricLabels& labels, double value) {
+  const std::string key = RenderLabels(labels);
+  const std::lock_guard<std::mutex> lock(mutex);
+  auto found = samples.find(key);
+  if (found == samples.end()) {
+    if (samples.size() >= max_series) {
+      ++dropped;
+      return;
+    }
+    found =
+        samples.emplace(key, Sample{.bucket_counts = std::vector<std::uint64_t>(buckets.size(), 0)})
+            .first;
+  }
+  Sample& sample = found->second;
+  sample.value += value;
+  ++sample.count;
+  const auto bucket = std::ranges::lower_bound(buckets, value);
+  if (bucket != buckets.end()) {
+    ++sample.bucket_counts[static_cast<std::size_t>(bucket - buckets.begin())];
+  }
+}
+
+}  // namespace internal
 
 MetricsRegistry::MetricsRegistry(std::size_t max_series, std::vector<double> latency_buckets)
     : max_series_(max_series), buckets_(std::move(latency_buckets)) {
@@ -147,12 +242,13 @@ void MetricsRegistry::Record(const RequestObservation& observation) {
     dropped = true;
   } else {
     if (latency == latencies_.end()) {
-      latency = latencies_
-                    .emplace(latency_key,
-                             Histogram{.counts = std::vector<std::uint64_t>(buckets_.size(), 0)})
-                    .first;
+      latency =
+          latencies_
+              .emplace(latency_key,
+                       HistogramData{.counts = std::vector<std::uint64_t>(buckets_.size(), 0)})
+              .first;
     }
-    Histogram& histogram = latency->second;
+    HistogramData& histogram = latency->second;
     histogram.sum_seconds += seconds;
     ++histogram.count;
     // The first bucket at or above the value; a value past the last one
@@ -165,6 +261,61 @@ void MetricsRegistry::Record(const RequestObservation& observation) {
   if (dropped) {
     ++observations_dropped_;
   }
+}
+
+std::shared_ptr<internal::MetricFamily> MetricsRegistry::Register(std::string name,
+                                                                  std::string help,
+                                                                  internal::MetricFamily::Kind kind,
+                                                                  std::vector<double> buckets) {
+  if (!ValidName(name, /*allow_colon=*/true)) {
+    smithy::internal::Fatal("smithy::server::MetricsRegistry: invalid metric name '" + name + "'");
+  }
+  // The built-ins are emitted unconditionally, so a family under one of their
+  // names would appear twice with two TYPE lines — a scrape Prometheus
+  // rejects whole.
+  for (const std::string_view reserved :
+       {"smithy_http_requests_total", "smithy_http_request_duration_seconds",
+        "smithy_http_requests_in_flight", "smithy_metrics_observations_dropped_total"}) {
+    if (name == reserved) {
+      smithy::internal::Fatal("smithy::server::MetricsRegistry: '" + name +
+                              "' is one of the built-in families");
+    }
+  }
+  const std::lock_guard<std::mutex> lock(mutex_);
+  if (auto found = families_.find(name); found != families_.end()) {
+    // Idempotent for an identical re-registration; a mismatch is the case
+    // that would corrupt the scrape, so it aborts rather than picking one.
+    const internal::MetricFamily& existing = *found->second;
+    if (existing.kind != kind || existing.help != help) {
+      smithy::internal::Fatal("smithy::server::MetricsRegistry: '" + name +
+                              "' is already registered with a different type or help text");
+    }
+    return found->second;
+  }
+  auto family = std::make_shared<internal::MetricFamily>();
+  family->name = std::move(name);
+  family->help = std::move(help);
+  family->kind = kind;
+  family->buckets = std::move(buckets);
+  family->max_series = max_series_;
+  families_.emplace(family->name, family);
+  return family;
+}
+
+Counter MetricsRegistry::NewCounter(std::string name, std::string help) {
+  return Counter(
+      Register(std::move(name), std::move(help), internal::MetricFamily::Kind::kCounter, {}));
+}
+
+Gauge MetricsRegistry::NewGauge(std::string name, std::string help) {
+  return Gauge(
+      Register(std::move(name), std::move(help), internal::MetricFamily::Kind::kGauge, {}));
+}
+
+Histogram MetricsRegistry::NewHistogram(std::string name, std::string help,
+                                        std::vector<double> buckets) {
+  return Histogram(Register(std::move(name), std::move(help),
+                            internal::MetricFamily::Kind::kHistogram, std::move(buckets)));
 }
 
 std::string MetricsRegistry::Expose() const {
@@ -232,6 +383,45 @@ std::string MetricsRegistry::Expose() const {
   out += "smithy_metrics_observations_dropped_total ";
   out += std::to_string(observations_dropped_);
   out += '\n';
+  // Application families last, each whole and in name order; their samples
+  // are already keyed by rendered labels, so a family's series are
+  // contiguous the way the format requires. `dropped` rides on the family's
+  // own line rather than the built-in counter, so a runaway label on one
+  // application metric is attributable to it.
+  for (const auto& [name, family] : families_) {
+    const std::lock_guard<std::mutex> family_lock(family->mutex);
+    const char* type = "counter";
+    if (family->kind == internal::MetricFamily::Kind::kGauge) type = "gauge";
+    if (family->kind == internal::MetricFamily::Kind::kHistogram) type = "histogram";
+    AppendFamilyHeader(out, name, type, family->help);
+    for (const auto& [labels, sample] : family->samples) {
+      if (family->kind != internal::MetricFamily::Kind::kHistogram) {
+        AppendSample(out, name, "", labels, FormatNumber(sample.value));
+        continue;
+      }
+      // Bucket lines always carry `le`, so they always have braces.
+      std::string bucket_labels;
+      std::uint64_t cumulative = 0;
+      for (std::size_t i = 0; i < family->buckets.size(); ++i) {
+        cumulative += sample.bucket_counts[i];
+        bucket_labels = labels.empty() ? std::string() : labels + ",";
+        bucket_labels += "le=\"";
+        bucket_labels += FormatNumber(family->buckets[i]);
+        bucket_labels += '"';
+        AppendSample(out, name, "_bucket", bucket_labels, std::to_string(cumulative));
+      }
+      bucket_labels = labels.empty() ? std::string() : labels + ",";
+      bucket_labels += "le=\"+Inf\"";
+      AppendSample(out, name, "_bucket", bucket_labels, std::to_string(sample.count));
+      AppendSample(out, name, "_sum", labels, FormatNumber(sample.value));
+      AppendSample(out, name, "_count", labels, std::to_string(sample.count));
+    }
+    if (family->dropped != 0) {
+      out += "smithy_metrics_observations_dropped_total{metric=\"" + EscapeLabel(name) + "\"} ";
+      out += std::to_string(family->dropped);
+      out += '\n';
+    }
+  }
   return out;
 }
 

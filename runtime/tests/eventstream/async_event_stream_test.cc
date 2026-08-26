@@ -173,9 +173,12 @@ TEST(PairAsyncTest, ATimedReceiveTimesOutAndALaterMessageWaitsForTheNextReceive)
 
 TEST(PairAsyncTest, AStaleDeadlineNeverFiresALaterReceive) {
   auto [a, b] = http::InMemoryWebSocketPair::Create();
-  // Park with a short deadline and complete it by delivery well inside it.
+  // Park with a bounded deadline and complete it by delivery well inside
+  // it — a full second of margin, so a scheduler stall (TSan's slowdown on
+  // a loaded runner) cannot let the deadline win a race this test is not
+  // about.
   Mailbox<Outcome<std::optional<Message>>> first;
-  a->ReceiveAsync(std::chrono::milliseconds(200),
+  a->ReceiveAsync(std::chrono::seconds(1),
                   [&](Outcome<std::optional<Message>> message) { first.Post(std::move(message)); });
   ASSERT_TRUE(b->Send(RawPing(1)).ok());
   ASSERT_TRUE(first.Wait().ok());
@@ -186,7 +189,7 @@ TEST(PairAsyncTest, AStaleDeadlineNeverFiresALaterReceive) {
   Mailbox<Outcome<std::optional<Message>>> second;
   a->ReceiveAsync(
       [&](Outcome<std::optional<Message>> message) { second.Post(std::move(message)); });
-  std::this_thread::sleep_for(std::chrono::milliseconds(400));
+  std::this_thread::sleep_for(std::chrono::milliseconds(1300));
   EXPECT_TRUE(second.Empty()) << "a stale deadline timed out a receive it never bounded";
 
   ASSERT_TRUE(b->Send(RawPing(2)).ok());

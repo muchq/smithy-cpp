@@ -321,6 +321,76 @@ TEST(MetricsRegistryTest, AnUnboundedCustomLabelIsCappedAndAttributed) {
       << exposition;
 }
 
+// The zero baseline. A series nobody has touched is absent from the scrape,
+// and a counter whose first exported sample is its first event's value hides
+// that event forever — increase() has nothing earlier to measure against, so
+// the panel reads zero, which looks like an answer.
+
+TEST(MetricsRegistryTest, ADeclaredSeriesExportsAtZeroBeforeAnyEvent) {
+  MetricsRegistry registry;
+  auto orders = registry.NewCounter("orders_processed_total", "Orders.");
+  orders.Declare({{"region", "us-east"}});
+
+  const std::string exposition = registry.Expose();
+  EXPECT_TRUE(HasLine(exposition, R"(orders_processed_total{region="us-east"} 0)")) << exposition;
+}
+
+TEST(MetricsRegistryTest, DeclaringDoesNotDisturbASeriesThatHasEvents) {
+  // Idempotent, and harmless after the fact: re-declaring must not reset a
+  // counter that has already counted something.
+  MetricsRegistry registry;
+  auto orders = registry.NewCounter("orders_processed_total", "Orders.");
+  orders.Increment(7);
+  orders.Declare();
+  orders.Declare();
+  EXPECT_TRUE(HasLine(registry.Expose(), "orders_processed_total 7")) << registry.Expose();
+}
+
+TEST(MetricsRegistryTest, ADeclaredHistogramIsEmptyRatherThanAnObservationOfZero) {
+  // The distinction that matters: a record-only API can only baseline a
+  // histogram by observing 0, which biases rate(_sum)/rate(_count). Writing
+  // the exposition directly means the declared series can be genuinely
+  // empty — every bucket, _sum and _count at 0 — so the first real
+  // observation is the only one the mean ever sees.
+  MetricsRegistry registry;
+  auto sizes = registry.NewHistogram("batch_size", "Rows per batch.", {10.0});
+  sizes.Declare();
+
+  std::string exposition = registry.Expose();
+  EXPECT_TRUE(HasLine(exposition, R"(batch_size_bucket{le="10"} 0)")) << exposition;
+  EXPECT_TRUE(HasLine(exposition, R"(batch_size_bucket{le="+Inf"} 0)")) << exposition;
+  EXPECT_TRUE(HasLine(exposition, "batch_size_sum 0")) << exposition;
+  EXPECT_TRUE(HasLine(exposition, "batch_size_count 0")) << exposition;
+
+  // One observation of 4 must read as a mean of 4, not 2 — which is what a
+  // baseline recorded as an observation would have produced.
+  sizes.Observe(4);
+  exposition = registry.Expose();
+  EXPECT_TRUE(HasLine(exposition, "batch_size_sum 4")) << exposition;
+  EXPECT_TRUE(HasLine(exposition, "batch_size_count 1")) << exposition;
+}
+
+TEST(MetricsRegistryTest, ADeclaredGaugeReadsZeroRatherThanBeingAbsent) {
+  MetricsRegistry registry;
+  auto depth = registry.NewGauge("queue_depth", "Pending jobs.");
+  depth.Declare();
+  EXPECT_TRUE(HasLine(registry.Expose(), "queue_depth 0")) << registry.Expose();
+}
+
+TEST(MetricsRegistryTest, DeclaringRespectsTheSeriesCap) {
+  // Declaration is series creation, so it cannot be a way around the cap.
+  MetricsRegistry registry(/*max_series=*/2);
+  auto seen = registry.NewCounter("user_events_total", "User events.");
+  for (int i = 0; i < 10; ++i) {
+    seen.Declare({{"user_id", std::to_string(i)}});
+  }
+  const std::string exposition = registry.Expose();
+  EXPECT_EQ(exposition.find(R"(user_id="9")"), std::string::npos) << exposition;
+  EXPECT_TRUE(HasLine(exposition,
+                      R"(smithy_metrics_observations_dropped_total{metric="user_events_total"} 8)"))
+      << exposition;
+}
+
 TEST(MetricsRegistryTest, ReMintingTheSameFamilyReturnsTheSameSeries) {
   // A helper handing out a handle repeatedly must not fork the family.
   MetricsRegistry registry;

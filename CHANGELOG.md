@@ -26,7 +26,9 @@ policy in [docs/versioning.md](docs/versioning.md).
   `smithy_metrics_observations_dropped_total`. Application metrics join the
   same scrape through `NewCounter` / `NewGauge` / `NewHistogram`, so one
   Prometheus target covers the service; the registry keeps owning escaping,
-  label ordering, and the per-family cap. See the Observability section of
+  label ordering, and the per-family cap. `Declare` exports a known series at
+  zero from startup, so the first event is a visible step rather than a
+  counter's invisible first sample. See the Observability section of
   [docs/production-guide.md](docs/production-guide.md).
 
 ### Fixed

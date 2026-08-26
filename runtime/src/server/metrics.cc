@@ -182,6 +182,22 @@ void MetricFamily::Observe(const MetricLabels& labels, double value) {
   }
 }
 
+void MetricFamily::Declare(const MetricLabels& labels) {
+  const std::string key = RenderLabels(labels);
+  const std::lock_guard<std::mutex> lock(mutex);
+  if (samples.contains(key)) {
+    return;  // idempotent, and never disturbs a series already carrying events
+  }
+  if (samples.size() >= max_series) {
+    ++dropped;
+    return;
+  }
+  // A counter or gauge baselines at 0; a histogram baselines as an empty
+  // distribution, which costs `_sum` and `_count` nothing — the mean stays
+  // unbiased, unlike recording a literal 0 observation.
+  samples.emplace(key, Sample{.bucket_counts = std::vector<std::uint64_t>(buckets.size(), 0)});
+}
+
 }  // namespace internal
 
 MetricsRegistry::MetricsRegistry(std::size_t max_series, std::vector<double> latency_buckets)

@@ -418,6 +418,19 @@ latency.Observe(elapsed.count());
 depth.Set(pending);
 ```
 
+Declare the series whose labels are known at startup — `orders.Declare({{"region",
+"us-east"}})`, or `depth.Declare()` for an unlabeled one. A series nobody has
+touched is simply absent from the scrape, and a counter whose first exported
+sample is its first event's value hides that event for good: `increase()` and
+`rate()` measure the change *between* samples, so with nothing earlier the
+first one shows no increase at all and the panel reads zero — worse than a
+missing tile, because it looks like an answer. Declaring is idempotent and
+never disturbs a series that already has events. A declared histogram is
+genuinely empty rather than an observation of zero, so `rate(_sum)/rate(_count)`
+stays unbiased. Labels carrying request data have no series to declare (and
+are the cardinality problem above); bound them to a known kind and declare
+that instead.
+
 Handles are cheap to copy and address the same family, so a handler can hold
 them as members. The registry keeps owning the parts that are easy to get
 wrong: label values are escaped, labels are sorted so `{a,b}` and `{b,a}` are

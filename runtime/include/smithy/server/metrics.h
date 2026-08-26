@@ -94,6 +94,8 @@ struct MetricFamily {
   // `set` replaces the value (a gauge Set); otherwise it adds to it.
   void Add(const MetricLabels& labels, double amount, bool set);
   void Observe(const MetricLabels& labels, double value);
+  // Materializes a series at its zero without recording an event.
+  void Declare(const MetricLabels& labels);
 };
 
 }  // namespace internal
@@ -106,6 +108,9 @@ class Counter {
   void Increment(const MetricLabels& labels, double amount = 1.0) {
     family_->Add(labels, amount, /*set=*/false);
   }
+  // Exports this series as 0 from startup; see the zero-baseline note on
+  // MetricsRegistry. Idempotent, and harmless once events have arrived.
+  void Declare(const MetricLabels& labels = {}) { family_->Declare(labels); }
 
  private:
   friend class MetricsRegistry;
@@ -124,6 +129,9 @@ class Gauge {
   }
   void Decrement(double amount = 1.0) { Increment(MetricLabels{}, -amount); }
   void Decrement(const MetricLabels& labels, double amount = 1.0) { Increment(labels, -amount); }
+  // Exports this series as 0 from startup; see the zero-baseline note on
+  // MetricsRegistry. Idempotent.
+  void Declare(const MetricLabels& labels = {}) { family_->Declare(labels); }
 
  private:
   friend class MetricsRegistry;
@@ -136,6 +144,12 @@ class Histogram {
  public:
   void Observe(double value) { Observe(MetricLabels{}, value); }
   void Observe(const MetricLabels& labels, double value) { family_->Observe(labels, value); }
+  // Exports this series as an empty distribution — every bucket, `_sum` and
+  // `_count` at 0 — from startup. Unlike a histogram behind a record-only
+  // API, this is not an observation of 0: it adds nothing to `_sum` or
+  // `_count`, so the windowed mean `rate(_sum)/rate(_count)` is unbiased.
+  // Idempotent.
+  void Declare(const MetricLabels& labels = {}) { family_->Declare(labels); }
 
  private:
   friend class MetricsRegistry;
@@ -174,6 +188,25 @@ class Histogram {
 // The cap applies per family, so a label chosen from unbounded data (a user
 // id, an order id) costs that family its own series budget and shows up in
 // the dropped counter — it cannot take the process down with it.
+//
+// Declare the series whose labels are known at startup:
+//
+//   orders.Declare({{"region", "us-east"}});
+//
+// A series that has never been touched does not exist in the scrape, and a
+// counter that springs into existence already carrying its first event's
+// value hides that event forever: `increase()` and `rate()` measure the
+// change *between* samples, so with nothing earlier to measure from, the
+// first one shows no increase at all. The panel reads zero, which is worse
+// than a missing tile because it looks like an answer. Declaring exports the
+// series as 0 from startup so the first real event is a visible step.
+//
+// Declare the label sets that are known up front — outcomes, error kinds,
+// regions. A label carrying request data has no series to declare (and is
+// the cardinality problem above); bound it to a known kind and declare that.
+// The built-in unlabeled families are always exported, so they are already
+// baselined; the per-operation ones cannot be, since this registry never
+// sees the model.
 class MetricsRegistry {
  public:
   // max_series bounds the distinct {method,operation,status} and

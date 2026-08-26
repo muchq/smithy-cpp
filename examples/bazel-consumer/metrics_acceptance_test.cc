@@ -43,7 +43,14 @@ class MetricsHandler final : public TodoHandler {
       : tasks_added_(metrics->NewCounter("todo_tasks_added_total", "Tasks added, by priority.")),
         title_length_(metrics->NewHistogram("todo_title_length_chars", "Task title length.",
                                             {8.0, 32.0, 128.0})),
-        tasks_stored_(metrics->NewGauge("todo_tasks_stored", "Tasks currently stored.")) {}
+        tasks_stored_(metrics->NewGauge("todo_tasks_stored", "Tasks currently stored.")) {
+    // The priority label has a bounded, known-at-startup set, so both series
+    // are declared: without this the first task of each kind lands as a
+    // counter's first sample and increase() never sees it.
+    tasks_added_.Declare({{"priority", "set"}});
+    tasks_added_.Declare({{"priority", "unset"}});
+    tasks_stored_.Declare();
+  }
 
   smithy::Outcome<AddTaskOutput> AddTask(const AddTaskInput& input,
                                          const smithy::server::RequestContext&) override {
@@ -205,6 +212,18 @@ TEST_F(MetricsAcceptanceTest, ApplicationMetricsShareTheEndpointWithTheBuiltIns)
 
   // Still one scrape: the built-in families are unaffected by the additions.
   EXPECT_NE(body.find(R"(operation="AddTask")"), std::string::npos) << body;
+}
+
+TEST_F(MetricsAcceptanceTest, DeclaredSeriesAreOnTheScrapeBeforeAnyTraffic) {
+  // The zero baseline, end to end: a dashboard built against this service
+  // reads 0 from startup rather than finding no series at all, so the first
+  // task added is a visible step instead of an invisible one.
+  const auto scrape = Scrape();
+  ASSERT_TRUE(scrape.ok()) << scrape.error().message();
+  const std::string& body = scrape->body;
+  EXPECT_NE(body.find(R"(todo_tasks_added_total{priority="set"} 0)"), std::string::npos) << body;
+  EXPECT_NE(body.find(R"(todo_tasks_added_total{priority="unset"} 0)"), std::string::npos) << body;
+  EXPECT_NE(body.find("todo_tasks_stored 0"), std::string::npos) << body;
 }
 
 }  // namespace

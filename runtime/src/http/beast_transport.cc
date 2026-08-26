@@ -704,6 +704,8 @@ class WsSession final : public WebSocketSessionBase,
       const std::lock_guard<std::mutex> lock(mutex_);
       if (pending_receive_) {
         receive = std::exchange(pending_receive_, nullptr);
+        // The park is over, so its deadline has nothing left to bound.
+        receive_deadline_.reset();
         handoff.emplace(std::move(message));
       } else {
         received_.push_back(std::move(message));
@@ -726,6 +728,15 @@ class WsSession final : public WebSocketSessionBase,
   // can never fire twice and the slots' emptiness stays the busy signal.
   using AsyncWaiters = WebSocket::TerminalWaiters;
   AsyncWaiters TakeAsyncWaitersLocked() {
+    // Whatever deadline bounded the receive being taken is spent with it.
+    // Destroying the timer cancels its pending wait, so the handler returns
+    // on operation_aborted instead of waking the executor for a park that
+    // no longer exists; the generation guard already made such a wakeup a
+    // no-op, this just spares it. Safe from any thread for the same reason
+    // ArmReceiveDeadlineLocked's emplace is: every touch of the timer is
+    // under mutex_, and the armed handler captures the session weakly
+    // rather than the timer.
+    receive_deadline_.reset();
     return {std::exchange(pending_receive_, nullptr), std::exchange(pending_send_, nullptr)};
   }
 

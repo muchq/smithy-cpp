@@ -77,18 +77,21 @@ class ConsumerSocket final : public WebSocket, public std::enable_shared_from_th
   // lock is released — the seam's documented shapes, nothing more.
   void ReceiveAsync(ReceiveCallback callback) override {
     Outcome<std::optional<Message>> immediate = std::optional<Message>();  // the clean end
+    // The same deliver-slot shape as the timed overload below: parking
+    // hands the completion to the session and empties this, so one park
+    // style covers both receives.
+    ReceiveCallback deliver = std::move(callback);
     {
       const std::lock_guard<std::mutex> lock(mutex_);
       if (!closed_ && !pending_receive_) {
-        pending_receive_ = std::move(callback);
+        pending_receive_ = std::exchange(deliver, nullptr);
         ++receive_park_generation_;  // a stale deadline must not fire this park
-        return;                      // EndSession completes it
-      }
-      if (!closed_) {
+      } else if (!closed_) {
         immediate = smithy::Error::Validation("consumer socket: a receive is already outstanding");
       }
     }
-    callback(std::move(immediate));
+    if (!deliver) return;  // parked: EndSession completes it
+    deliver(std::move(immediate));
   }
 
   // The deadline overload (#130): the same park, bounded by a watchdog

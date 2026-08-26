@@ -370,6 +370,44 @@ config.interceptors.push_back(smithy::PropagateTraceContext());
 `GenerateSpanId` — for building richer integrations (e.g. a server
 middleware that opens a span from `RequestObservation::trace_parent`).
 
+**Prometheus:** the one bundled backend, because the text exposition format
+needs no client library — it is a few lines of text over HTTP, so it costs
+zero dependencies. Two middleware compose around the generated handler:
+
+```cpp
+auto metrics = std::make_shared<smithy::server::MetricsRegistry>();
+transport.Start(smithy::server::Chain({smithy::server::MetricsEndpoint(metrics),
+                                       smithy::server::RecordMetrics(metrics)},
+                                      server.Handler()));
+```
+
+`RecordMetrics` is `Observe` wired to the registry, so request timing has one
+implementation and the scraped numbers cannot drift from the logged ones. The
+order above is deliberate: the endpoint sits *outside* the recorder, so
+scrapes answer without being counted as served traffic — swap them and every
+scrape inflates your own request rate, at whatever interval Prometheus polls.
+
+Three families are exposed on `/metrics` (path configurable):
+`smithy_http_requests_total{method,operation,status}`,
+`smithy_http_request_duration_seconds{method,operation}` (a histogram, so
+`histogram_quantile` gives you tail latency), and
+`smithy_http_requests_in_flight`.
+
+The label set is bounded by construction, because cardinality is what
+actually kills a metrics endpoint. `target` is deliberately *not* a label —
+it carries path parameters and query strings, so one series per distinct URL
+is one series per request id; `operation` is the bounded stand-in the router
+stamps from the model, empty for the 404/405/400 dispatch failures that never
+reached an operation. `method` arrives from the wire, so anything outside the
+standard HTTP set collapses to `other` rather than minting a series per
+invented verb. Past `max_series` combinations the registry stops minting and
+counts what it refused in `smithy_metrics_observations_dropped_total` — alert on
+that being non-zero rather than discovering the cap as an OOM.
+
+The endpoint is unauthenticated: it is middleware, so gate it the way you
+gate anything else — compose `Guard` or `RequireBearerAuth` outside it, or
+bind the scrape listener somewhere the internet cannot reach.
+
 **OpenTelemetry:** not bundled, by design — opentelemetry-cpp's dependency
 tree (protobuf, gRPC for OTLP) would violate the runtime's dep-light rule.
 The hooks above map 1:1 onto OTel spans and metrics; an optional

@@ -574,12 +574,14 @@ cc_test(
 cc_library(
     name = "server",
     srcs = [
+        "src/server/metrics.cc",
         "src/server/middleware.cc",
         "src/server/origin_gate.cc",
         "src/server/router.cc",
         "src/server/websocket_router.cc",
     ],
     hdrs = [
+        "include/smithy/server/metrics.h",
         "include/smithy/server/middleware.h",
         "include/smithy/server/origin_gate.h",
         "include/smithy/server/router.h",
@@ -625,6 +627,17 @@ cc_test(
     copts = COPTS,
     deps = [
         ":http",
+        ":server",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "metrics_test",
+    size = "small",
+    srcs = ["tests/server/metrics_test.cc"],
+    copts = COPTS,
+    deps = [
         ":server",
         "@googletest//:gtest_main",
     ],

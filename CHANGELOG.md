@@ -6,6 +6,26 @@ policy in [docs/versioning.md](docs/versioning.md).
 
 ## [Unreleased]
 
+### Added
+
+- **A dependency-free Prometheus `/metrics` endpoint** (#91, first work
+  item). `smithy::server::MetricsRegistry` aggregates the existing `Observe`
+  hooks into three families —
+  `smithy_http_requests_total{method,operation,status}`,
+  `smithy_http_request_duration_seconds{method,operation}` (histogram), and
+  `smithy_http_requests_in_flight` — and `MetricsEndpoint` serves them in the
+  text exposition format, which needs no client library and so costs zero new
+  dependencies. `RecordMetrics` is `Observe` wired to a registry, so request
+  timing keeps one implementation and the scraped numbers cannot drift from
+  the logged ones; compose the endpoint outside the recorder and scrapes
+  answer without inflating the request rate they report. Label cardinality is
+  bounded by construction: `target` is never a label (path parameters and
+  query strings would mint a series per request id), an off-wire `method`
+  outside the standard set collapses to `other`, and a series cap backstops
+  anything unforeseen while counting what it refused in
+  `smithy_metrics_observations_dropped_total`. See the Observability section of
+  [docs/production-guide.md](docs/production-guide.md).
+
 ### Fixed
 
 - **Numeric wire values no longer truncate into generated narrow types**

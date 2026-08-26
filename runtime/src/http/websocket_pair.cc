@@ -198,7 +198,12 @@ class PairEnd final : public WebSocket {
                           WebSocket::ReceiveCallback callback) {
     WebSocket::SendCallback absorbed;
     Outcome<std::optional<eventstream::Message>> immediate = std::optional<eventstream::Message>();
-    // 0 = not parked (the generation counter starts at 1 on the first park).
+    // The completion this call still owes, fired once the lock is released.
+    // Parking hands it to the session instead and leaves this empty (the
+    // std::exchange emptying is the same one the terminal paths rely on),
+    // so which of the two happened is read off the slot itself rather than
+    // off a flag a reader — or the analyzer — has to correlate with it.
+    WebSocket::ReceiveCallback deliver;
     std::uint64_t parked_generation = 0;
     {
       const std::lock_guard<std::mutex> lock(state_->mutex);
@@ -206,6 +211,7 @@ class PairEnd final : public WebSocket {
         callback(Error::Validation("websocket pair: a receive is already outstanding"));
         return;
       }
+      deliver = std::move(callback);
       std::deque<eventstream::Message>& inbound = state_->queues[1 - send_index_];
       if (!inbound.empty()) {
         eventstream::Message message = std::move(inbound.front());
@@ -220,17 +226,17 @@ class PairEnd final : public WebSocket {
         // timeout, completed inline like the other immediates.
         immediate = Error::Timeout("websocket pair: no message within the receive deadline");
       } else {
-        state_->pending_receive[send_index_] = std::move(callback);
+        state_->pending_receive[send_index_] = std::exchange(deliver, nullptr);
         parked_generation = ++state_->receive_park_generation[send_index_];
       }
     }
-    if (parked_generation != 0) {
-      // A send, the deadline, or the close completes the park.
+    if (!deliver) {
+      // Parked: a send, the deadline, or the close completes it.
       if (timeout.has_value()) ArmReceiveDeadline(parked_generation, *timeout);
       return;
     }
     if (absorbed) absorbed(Unit{});
-    callback(std::move(immediate));
+    deliver(std::move(immediate));
   }
 
   // Spawns the watchdog for the park `generation` — outside the lock, so

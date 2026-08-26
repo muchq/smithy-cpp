@@ -100,11 +100,14 @@ class ConsumerSocket final : public WebSocket, public std::enable_shared_from_th
   // behind pthread_create.
   void ReceiveAsync(std::chrono::milliseconds timeout, ReceiveCallback callback) override {
     Outcome<std::optional<Message>> immediate = std::optional<Message>();  // the clean end
+    // The completion this call still owes; parking hands it to the session
+    // and leaves this empty, so the slot itself says which happened.
+    ReceiveCallback deliver = std::move(callback);
     std::uint64_t parked_generation = 0;  // 0 = not parked (the counter starts at 1)
     {
       const std::lock_guard<std::mutex> lock(mutex_);
       if (!closed_ && !pending_receive_ && timeout > std::chrono::milliseconds::zero()) {
-        pending_receive_ = std::move(callback);
+        pending_receive_ = std::exchange(deliver, nullptr);
         parked_generation = ++receive_park_generation_;
       } else if (!closed_ && pending_receive_) {
         immediate = smithy::Error::Validation("consumer socket: a receive is already outstanding");
@@ -114,11 +117,11 @@ class ConsumerSocket final : public WebSocket, public std::enable_shared_from_th
         immediate = smithy::Error::Timeout("consumer socket: no message within the deadline");
       }
     }
-    if (parked_generation != 0) {
+    if (!deliver) {
       ArmDeadline(parked_generation, timeout);  // EndSession or the deadline completes it
       return;
     }
-    callback(std::move(immediate));
+    deliver(std::move(immediate));
   }
 
   void SendAsync(const Message& message, SendCallback callback) override {

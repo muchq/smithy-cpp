@@ -447,8 +447,12 @@ class WsSession final : public WebSocketSessionBase,
   // handler captures the session weakly: a deadline must never extend a
   // session's life.
   void ArmReceiveDeadlineLocked(std::chrono::milliseconds timeout) {
+    // Saturate far-future deadlines (milliseconds::max() as "practically
+    // forever") instead of overflowing the timer's now + duration into the
+    // past and firing a spurious instant timeout.
+    constexpr std::chrono::milliseconds kMaxWait = std::chrono::hours(24 * 365);
     receive_deadline_.emplace(ws_.get_executor());
-    receive_deadline_->expires_after(timeout);
+    receive_deadline_->expires_after(std::min(timeout, kMaxWait));
     receive_deadline_->async_wait(
         [weak = this->weak_from_this(),
          generation = receive_park_generation_](const boost::system::error_code& ec) {

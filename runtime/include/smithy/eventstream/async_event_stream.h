@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <coroutine>
 #include <exception>
 #include <functional>
@@ -178,22 +179,29 @@ inline SendMessageAwaitable SendMessage(std::shared_ptr<http::WebSocket> socket,
 // One-outstanding-per-class passes through; single-shot like its twin.
 class [[nodiscard]] ReceiveMessageAwaitable {
  public:
-  explicit ReceiveMessageAwaitable(std::shared_ptr<http::WebSocket> socket)
-      : socket_(std::move(socket)) {}
+  explicit ReceiveMessageAwaitable(std::shared_ptr<http::WebSocket> socket,
+                                   std::optional<std::chrono::milliseconds> timeout = std::nullopt)
+      : socket_(std::move(socket)), timeout_(timeout) {}
   // NOLINTNEXTLINE(readability-convert-member-functions-to-static)
   bool await_ready() const noexcept { return false; }
   bool await_suspend(std::coroutine_handle<> coroutine) {
     // The second-arrival-resumes race, as in AsyncEventStream's awaitables.
-    socket_->ReceiveAsync([this, coroutine](Outcome<std::optional<Message>> message) {
+    auto completion = [this, coroutine](Outcome<std::optional<Message>> message) {
       received_ = std::move(message);
       if (arrived_.exchange(true)) coroutine.resume();
-    });
+    };
+    if (timeout_.has_value()) {
+      socket_->ReceiveAsync(*timeout_, std::move(completion));
+    } else {
+      socket_->ReceiveAsync(std::move(completion));
+    }
     return !arrived_.exchange(true);  // suspend iff the callback has not run
   }
   Outcome<std::optional<Message>> await_resume() noexcept { return std::move(received_); }
 
  private:
   std::shared_ptr<http::WebSocket> socket_;
+  std::optional<std::chrono::milliseconds> timeout_;
   std::atomic<bool> arrived_{false};
   // Outcome has no default constructor; the placeholder is overwritten
   // before any resume. NOLINT(readability-redundant-member-init)
@@ -202,6 +210,17 @@ class [[nodiscard]] ReceiveMessageAwaitable {
 
 inline ReceiveMessageAwaitable ReceiveMessage(std::shared_ptr<http::WebSocket> socket) {
   return ReceiveMessageAwaitable(std::move(socket));
+}
+
+// The same await under a deadline (#130): a coroutine that must not park
+// forever on a peer that may never send. Resolves with the socket's timed
+// receive outcomes — the message, the clean close, the terminal error, or
+// Error::Timeout ("TimeoutError"), which is not terminal: the session and
+// its receive slot are exactly as a completed receive leaves them, so the
+// loop can await again, send, or close on its own schedule.
+inline ReceiveMessageAwaitable ReceiveMessage(std::shared_ptr<http::WebSocket> socket,
+                                              std::chrono::milliseconds timeout) {
+  return ReceiveMessageAwaitable(std::move(socket), timeout);
 }
 
 // The typed session's coroutine adapter (ADR-0019): EventStream's contract
@@ -261,7 +280,9 @@ class AsyncEventStream {
   // is closed and the error is the awaited result.
   class [[nodiscard]] ReceiveAwaitable {
    public:
-    explicit ReceiveAwaitable(AsyncEventStream* stream) : stream_(stream) {}
+    explicit ReceiveAwaitable(AsyncEventStream* stream,
+                              std::optional<std::chrono::milliseconds> timeout = std::nullopt)
+        : stream_(stream), timeout_(timeout) {}
     bool await_ready() const noexcept { return false; }
     bool await_suspend(std::coroutine_handle<> coroutine) {
       // The completion may fire before this returns (immediate refusals,
@@ -272,13 +293,22 @@ class AsyncEventStream {
       // and only a truly asynchronous completion resumes from the callback.
       // The flag can live in the awaitable: the frame dies only after a
       // resume, and every resume is sequenced after both exchanges.
-      stream_->socket_->ReceiveAsync([this, coroutine](Outcome<std::optional<Message>> message) {
+      auto completion = [this, coroutine](Outcome<std::optional<Message>> message) {
         raw_ = std::move(message);
         if (arrived_.exchange(true)) coroutine.resume();
-      });
+      };
+      if (timeout_.has_value()) {
+        stream_->socket_->ReceiveAsync(*timeout_, std::move(completion));
+      } else {
+        stream_->socket_->ReceiveAsync(std::move(completion));
+      }
       return !arrived_.exchange(true);  // suspend iff the callback has not run
     }
     Outcome<std::optional<Rx>> await_resume() {
+      // A timeout (code "TimeoutError") arrives here as raw_'s error and
+      // passes through untouched: it is not terminal, nothing is closed,
+      // and the next co_await picks the stream up where it left off. Only
+      // a decoder rejection below ends the session.
       if (!raw_.ok()) return std::move(raw_).error();
       std::optional<Message>& message = *raw_;
       if (!message.has_value()) return std::optional<Rx>();
@@ -292,6 +322,7 @@ class AsyncEventStream {
 
    private:
     AsyncEventStream* stream_;
+    std::optional<std::chrono::milliseconds> timeout_;
     std::atomic<bool> arrived_{false};
     // Outcome has no default constructor; the placeholder is overwritten
     // before any resume. NOLINT(readability-redundant-member-init)
@@ -299,6 +330,23 @@ class AsyncEventStream {
   };
 
   ReceiveAwaitable Receive() { return ReceiveAwaitable(this); }
+
+  // Receive under a deadline (#130) — the async twin of EventStream's
+  // timed Receive, for a loop that must not park forever on an event the
+  // peer may never send:
+  //
+  //   auto event = co_await stream.Receive(std::chrono::seconds(2));
+  //   if (!event.ok() && event.error().code() == "TimeoutError") { ... }
+  //
+  // Same outcomes plus Error::Timeout, and the same rule as the blocking
+  // overload: a timeout is not terminal — the session stays usable, the
+  // receive slot is released, and an event the wire delivers after the
+  // deadline waits in the session for the next await. A non-positive
+  // timeout polls. The deadline bounds THIS await only; the session's own
+  // idle timeout still governs a quiet wire.
+  ReceiveAwaitable Receive(std::chrono::milliseconds timeout) {
+    return ReceiveAwaitable(this, timeout);
+  }
 
   // Awaits one event onto the wire. Encoder failures surface without
   // suspending and leave the session untouched; wire failures are the

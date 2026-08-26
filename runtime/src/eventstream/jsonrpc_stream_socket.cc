@@ -125,34 +125,45 @@ Outcome<Unit> JsonRpcStreamSocket::Send(const Message& message) {
 void JsonRpcStreamSocket::Close() { inner_->Close(); }
 
 void JsonRpcStreamSocket::ReceiveAsync(ReceiveCallback callback) {
+  inner_->ReceiveAsync(PoliceAsync(std::move(callback)));
+}
+
+void JsonRpcStreamSocket::ReceiveAsync(std::chrono::milliseconds timeout,
+                                       ReceiveCallback callback) {
+  // A timeout arrives as !ok() and rides through the classifier untouched
+  // (no violation, no close) — the wrapper stays exactly as usable as the
+  // socket under it, mirroring the blocking deadline overload.
+  inner_->ReceiveAsync(timeout, PoliceAsync(std::move(callback)));
+}
+
+JsonRpcStreamSocket::ReceiveCallback JsonRpcStreamSocket::PoliceAsync(ReceiveCallback callback) {
   // State travels by value into the completion: the wrapper may be gone by
   // the time the transport completes. The owning form pins the inner
   // socket through `owner`; the borrowing form rides its documented
   // blocking-seam lifetime contract.
-  inner_->ReceiveAsync(
-      [id = id_, role = role_, owner = owner_, inner = inner_,
-       callback = std::move(callback)](Outcome<std::optional<Message>> raw) mutable {
-        Inbound inbound = ClassifyInbound(std::move(raw), id, role);
-        if (inbound.violation_text.has_value()) {
-          // The close AND the caller's resumption both ride the send's
-          // completion: the close cannot cancel the terminal write (the
-          // ADR-0021 lesson), and neither can the caller — a generated driver
-          // closes the session as it unwinds, which would escalate past the
-          // in-flight terminal — because it never runs until the frame is on
-          // the wire and the close is already requested.
-          auto terminal = std::make_shared<Message>();
-          terminal->payload = Blob::FromString(*std::move(inbound.violation_text));
-          inner->SendAsync(*terminal,
-                           [terminal, owner, inner, result = std::move(inbound.result),
-                            callback = std::move(callback)](const Outcome<Unit>& /*sent*/) mutable {
-                             inner->Close();
-                             callback(std::move(result));
-                           });
-          return;
-        }
-        if (inbound.close) inner->Close();
-        callback(std::move(inbound.result));
-      });
+  return [id = id_, role = role_, owner = owner_, inner = inner_,
+          callback = std::move(callback)](Outcome<std::optional<Message>> raw) mutable {
+    Inbound inbound = ClassifyInbound(std::move(raw), id, role);
+    if (inbound.violation_text.has_value()) {
+      // The close AND the caller's resumption both ride the send's
+      // completion: the close cannot cancel the terminal write (the
+      // ADR-0021 lesson), and neither can the caller — a generated driver
+      // closes the session as it unwinds, which would escalate past the
+      // in-flight terminal — because it never runs until the frame is on
+      // the wire and the close is already requested.
+      auto terminal = std::make_shared<Message>();
+      terminal->payload = Blob::FromString(*std::move(inbound.violation_text));
+      inner->SendAsync(*terminal,
+                       [terminal, owner, inner, result = std::move(inbound.result),
+                        callback = std::move(callback)](const Outcome<Unit>& /*sent*/) mutable {
+                         inner->Close();
+                         callback(std::move(result));
+                       });
+      return;
+    }
+    if (inbound.close) inner->Close();
+    callback(std::move(inbound.result));
+  };
 }
 
 void JsonRpcStreamSocket::SendAsync(const Message& message, SendCallback callback) {

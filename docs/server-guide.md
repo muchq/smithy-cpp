@@ -140,6 +140,12 @@ while (true) {
 }
 ```
 
+The completion-driven seam has the same watchdog (#130): a `Detached` loop bounds its
+await with `co_await stream.Receive(std::chrono::seconds(1))` and gets the same
+`TimeoutError` on a session that keeps serving — the loop above works verbatim as a
+coroutine. `ReceiveMessage(socket, timeout)` bounds the raw pre-stream await the same
+way (the jsonRpc2 opening-envelope read).
+
 Whatever method the operation models, upgrades are always GET — a WebSocket upgrade is a
 GET on the wire, and the generated routes register accordingly: on the modeled URI for
 the binding protocols, on the shared `/` endpoint for jsonRpc2 (ADR-0023), whose opening

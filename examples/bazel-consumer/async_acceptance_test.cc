@@ -101,6 +101,50 @@ Detached Serve(smithy::server::SessionRegistry<Message>& registry, std::string i
   stream.Close();
 }
 
+// The #130 watchdog, out of tree and over a real socket: a hand-written
+// Detached loop — the deadline's stated audience — bounds its await
+// against a peer that says nothing unsolicited, treats the timeout as a
+// tick rather than an end, and the same coroutine still serves the
+// message that arrives after one.
+TEST(AsyncAcceptanceTest, AnAwaitedReceiveDeadlineTicksWithoutEndingTheSession) {
+  BeastServerTransport::Options options;
+  options.on_websocket = [](const HttpRequest&, WebSocket& socket) {
+    while (true) {
+      auto message = socket.Receive();
+      if (!message.ok() || !message->has_value()) return;
+      if (!socket.Send(Event("echo", "echo:" + (*message)->payload.ToString())).ok()) return;
+    }
+  };
+  BeastServerTransport server(options);
+  ASSERT_TRUE(server.Start(NotFound).ok());
+  auto dialed = BeastWebSocketClient::Dial({.host = "127.0.0.1", .port = server.port()});
+  ASSERT_TRUE(dialed.ok()) << dialed.error().message();
+
+  std::promise<std::string> first_timeout_code;
+  std::promise<std::string> echoed;
+  [](std::shared_ptr<WebSocket> socket, std::promise<std::string>* timeout_code,
+     std::promise<std::string>* echoed) -> Detached {
+    AsyncEventStream<Message, Message> stream(std::move(socket), Identity, Identity);
+    // Quiet wire: the bounded await resolves with the timeout, terminally
+    // for nothing — the session and the loop both continue.
+    auto nothing = co_await stream.Receive(std::chrono::milliseconds(75));
+    timeout_code->set_value(nothing.ok() ? "ok" : nothing.error().code());
+    (void)co_await stream.Send(Event("chat", "after the deadline"));
+    auto echo = co_await stream.Receive(std::chrono::seconds(10));
+    echoed->set_value(echo.ok() && echo->has_value() ? (**echo).payload.ToString() : "<no echo>");
+    stream.Close();
+  }(*dialed, &first_timeout_code, &echoed);
+
+  auto code = first_timeout_code.get_future();
+  ASSERT_EQ(code.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+  EXPECT_EQ(code.get(), "TimeoutError");
+
+  auto reply = echoed.get_future();
+  ASSERT_EQ(reply.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+  EXPECT_EQ(reply.get(), "echo:after the deadline");
+  server.Stop();
+}
+
 TEST(AsyncAcceptanceTest, ThreeSessionsShareOneHandlerThreadAndAFanOutRegistry) {
   // Declared before the transport on purpose: sessions reference the
   // registry from their coroutines, so it must outlive them.

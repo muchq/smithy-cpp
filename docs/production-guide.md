@@ -203,8 +203,9 @@ transport.Start(smithy::server::Chain(
      smithy::server::PerClientRateLimit(
          [limiter](const std::string& client) { return limiter->Allow(client); },
          trusted, std::chrono::seconds(30)),
-     // Observe everything admitted — health probes included. on_start
-     // (optional) enables an in-flight gauge; on_complete carries
+     // Observe everything admitted — health probes included, reporting
+     // `operation` as their own path so a dashboard can filter them out.
+     // on_start (optional) enables an in-flight gauge; on_complete carries
      // method/target/operation/status/duration/trace_parent.
      smithy::server::Observe(
          [](const smithy::server::RequestObservation& o) {
@@ -339,7 +340,8 @@ OpenTelemetry — plugs in without the core taking a telemetry dependency.
 
 **Server:** `Observe` (above) reports, per request: `method`, `target`,
 `operation` (the Smithy operation that handled it, stamped by the generated
-router; empty for 404/405/400 dispatch failures), `status`, `duration`, and
+router; the endpoint's own path for `HealthEndpoint` and `MetricsEndpoint`;
+empty for 404/405/400 dispatch failures), `status`, `duration`, and
 `trace_parent` — the request's W3C `traceparent` header, which always parses:
 a valid inbound one continues verbatim, and the transport ingress mints a
 fresh root when the client sent none or sent garbage (ADR-0011). The same
@@ -398,7 +400,14 @@ actually kills a metrics endpoint. `target` is deliberately *not* a label —
 it carries path parameters and query strings, so one series per distinct URL
 is one series per request id; `operation` is the bounded stand-in the router
 stamps from the model, empty for the 404/405/400 dispatch failures that never
-reached an operation. `method` arrives from the wire, so anything outside the
+reached an operation. `HealthEndpoint` and `MetricsEndpoint` answer paths the
+model does not define, so they stamp that path as their operation
+(`operation="/livez"`): probes are usually a service's highest-volume route,
+and left unlabeled they would bury the 404 rate in the empty operation they
+share with it, and mix their own latency into the same duration histogram.
+The path is fixed at composition, so it is one series per composed endpoint —
+compose the probes inside `RecordMetrics` if you want them counted, outside
+it if you do not. `method` arrives from the wire, so anything outside the
 standard HTTP set collapses to `other` rather than minting a series per
 invented verb. Past `max_series` combinations the registry stops minting and
 counts what it refused in `smithy_metrics_observations_dropped_total` — alert on

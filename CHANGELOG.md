@@ -36,6 +36,18 @@ policy in [docs/versioning.md](docs/versioning.md).
 
 ### Fixed
 
+- **Health probes are distinguishable from dispatch failures in observability
+  hooks.** `HealthEndpoint` built its response without stamping
+  `HttpResponse::operation`, so every probe reached `Observe` (and so any
+  metrics or logging backend) as the empty operation — the same value
+  404/405/400 use. Since Kubernetes polls a probe every few seconds, that is
+  usually the highest-volume path a service has, and merging the two meant
+  the 404 rate could not be read, the probe's own latency contaminated the
+  service's duration histogram, and no filter could separate them.
+  `HealthEndpoint` and `MetricsEndpoint` now report their own configured path
+  as the operation (`/livez`, `/readyz`, `/metrics`), which is fixed at
+  composition and so adds one series per composed endpoint. Chains that do
+  not observe probe traffic are unaffected.
 - **Numeric wire values no longer truncate into generated narrow types**
   (#109). Three holes in the otherwise-uniform range-check posture: an
   `intEnum` member in a document body cast the raw wire int64 straight into

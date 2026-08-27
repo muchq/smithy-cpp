@@ -38,7 +38,9 @@ struct HttpResponse {
   // Server-side annotation, never written to the wire: the Smithy operation
   // whose route produced this response (stamped by the generated router so
   // observability middleware can label by operation; empty on 404/405/400
-  // dispatch failures and hand-rolled handlers).
+  // dispatch failures and hand-rolled handlers). Built-in endpoints that
+  // answer off-model paths (HealthEndpoint, MetricsEndpoint) stamp that path
+  // instead, so their traffic is distinguishable from a dispatch failure.
   std::string operation{};
 };
 

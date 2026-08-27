@@ -599,6 +599,63 @@ TEST(MetricsEndpointTest, RecordMetricsCarriesTheOperationAndStatusFromTheRespon
               R"(smithy_http_requests_total{method="GET",operation="GetThing",status="503"} 1)"));
 }
 
+TEST(MetricsEndpointTest, HealthProbesAreSeparableFromDispatchFailures) {
+  // The reason HealthEndpoint labels its own path. Kubernetes polls a probe
+  // every few seconds, so it is often the highest-volume "route" a service
+  // has. Sharing the empty operation with 404s means the probe drowns the
+  // signal in `smithy_http_requests_total{operation=""}` and the 404 rate
+  // cannot be read at all — and the probe's own latency, which is not the
+  // service's, contaminates the same duration series.
+  auto registry = std::make_shared<MetricsRegistry>();
+  http::RequestHandler handler =
+      Chain({MetricsEndpoint(registry), RecordMetrics(registry), HealthEndpoint("/livez"),
+             HealthEndpoint("/readyz", {{"db", [] { return false; }}})},
+            [](const http::HttpRequest&) {
+              http::HttpResponse response;  // the router's 404: no operation to stamp
+              response.status = 404;
+              return response;
+            });
+
+  handler(Get("/livez"));
+  handler(Get("/readyz"));
+  handler(Get("/nope"));
+
+  const std::string exposition = handler(Get("/metrics")).body;
+  EXPECT_TRUE(HasLine(
+      exposition, R"(smithy_http_requests_total{method="GET",operation="/livez",status="200"} 1)"))
+      << exposition;
+  EXPECT_TRUE(HasLine(
+      exposition, R"(smithy_http_requests_total{method="GET",operation="/readyz",status="503"} 1)"))
+      << exposition;
+  // The 404 keeps the empty operation, and now means only that.
+  EXPECT_TRUE(HasLine(exposition,
+                      R"(smithy_http_requests_total{method="GET",operation="",status="404"} 1)"))
+      << exposition;
+  // Each probe has its own latency series, so `operation!~"/livez|/readyz"`
+  // is expressible; before the label none of these three could be told apart.
+  EXPECT_TRUE(HasLine(exposition, R"(smithy_http_request_duration_seconds_count{method="GET",)"
+                                  R"(operation="/livez"} 1)"))
+      << exposition;
+  EXPECT_TRUE(HasLine(exposition, R"(smithy_http_request_duration_seconds_count{method="GET",)"
+                                  R"(operation="/readyz"} 1)"))
+      << exposition;
+}
+
+TEST(MetricsEndpointTest, TheEndpointLabelsItselfWhenDeliberatelyRecorded) {
+  // Inverted from the documented order on purpose: a user who wants scrape
+  // volume as a signal gets a named series rather than an unlabeled one.
+  auto registry = std::make_shared<MetricsRegistry>();
+  http::RequestHandler handler =
+      Chain({RecordMetrics(registry), MetricsEndpoint(registry)}, Handler());
+
+  handler(Get("/metrics"));
+  const std::string exposition = handler(Get("/metrics")).body;
+  EXPECT_TRUE(
+      HasLine(exposition,
+              R"(smithy_http_requests_total{method="GET",operation="/metrics",status="200"} 1)"))
+      << exposition;
+}
+
 TEST(MetricsEndpointTest, AThrowingHandlerStillCompletesItsObservation) {
   // Observe pairs start and complete even when dispatch throws (reporting
   // 500 with an empty operation) — the gauge must come back down, or an

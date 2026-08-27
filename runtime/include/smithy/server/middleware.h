@@ -92,6 +92,10 @@ struct ReadinessCheck {
 // A HEAD is answered like the GET, body included: the transport withholds
 // the octets and keeps the length (RFC 9110 §9.3.2), and that length is
 // what the HEAD was asking for.
+//
+// Probe responses carry <path> as their HttpResponse::operation, so a probe
+// composed inside an observability chain reports as itself rather than as
+// the empty operation that 404s and 405s already use.
 Middleware HealthEndpoint(std::string path = "/health", std::vector<ReadinessCheck> checks = {});
 
 // One served request, as seen from outside the router.
@@ -100,7 +104,9 @@ struct RequestObservation {
   std::string target;
   // The Smithy operation that handled the request (from the generated
   // router's HttpResponse::operation annotation); empty for 404/405/400
-  // dispatch failures.
+  // dispatch failures. HealthEndpoint and MetricsEndpoint report their own
+  // path here, so `operation="/health"` can be filtered out of a latency
+  // panel and an empty operation means a dispatch failure and nothing else.
   std::string operation;
   // The request's W3C traceparent header, verbatim, for log correlation.
   // Never empty for requests served through a transport: the ingress mints a

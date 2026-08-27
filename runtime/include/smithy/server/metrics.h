@@ -334,6 +334,10 @@ inline auto RecordRejections(std::shared_ptr<MetricsRegistry> registry) {
 // withholds the octets and keeps the length (RFC 9110 §9.3.2), which is the
 // only question a HEAD asks. A null registry aborts at composition time.
 //
+// The response carries <path> as its HttpResponse::operation, which the
+// documented composition never reads — it matters only if you deliberately
+// put the endpoint inside the recorder to measure scrape volume.
+//
 // The endpoint is unauthenticated: it is middleware, so gate it the way you
 // gate anything else — compose Guard or RequireBearerAuth outside it, or
 // bind the scrape listener somewhere the internet cannot reach.

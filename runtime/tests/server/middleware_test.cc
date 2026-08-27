@@ -422,6 +422,50 @@ TEST(HealthEndpointTest, AnswersGetOnThePath) {
   EXPECT_FALSE(reached);
 }
 
+TEST(HealthEndpointTest, LabelsItsResponseWithItsOwnPath) {
+  // Without this the probe reports as the empty operation, which is what a
+  // 404 reports too — so a metrics backend cannot tell a liveness probe from
+  // a request for a route that does not exist.
+  auto live =
+      Chain({HealthEndpoint("/livez")}, [](const http::HttpRequest&) { return Ok("router"); });
+  auto ready = Chain({HealthEndpoint("/readyz", {{"db", [] { return false; }}})},
+                     [](const http::HttpRequest&) { return Ok("router"); });
+
+  http::HttpRequest request;
+  request.method = "GET";
+  request.target = "/livez";
+  EXPECT_EQ(live(request).operation, "/livez");
+
+  // The 503 path is labeled too: an unhealthy probe is the one you most need
+  // to find on a dashboard.
+  request.target = "/readyz";
+  const auto unhealthy = ready(request);
+  EXPECT_EQ(unhealthy.status, 503);
+  EXPECT_EQ(unhealthy.operation, "/readyz");
+
+  // Two instances on one server stay distinguishable rather than collapsing
+  // into a single "health" bucket, and a HEAD is labeled like its GET.
+  http::HttpRequest head;
+  head.method = "HEAD";
+  head.target = "/livez";
+  EXPECT_EQ(live(head).operation, "/livez");
+  head.target = "/readyz";
+  EXPECT_EQ(ready(head).operation, "/readyz");
+}
+
+TEST(HealthEndpointTest, LeavesTheOperationToTheRouterOnPassThrough) {
+  auto handler = Chain({HealthEndpoint()}, [](const http::HttpRequest&) {
+    http::HttpResponse response;
+    response.operation = "GetThing";
+    return response;
+  });
+
+  http::HttpRequest request;
+  request.method = "GET";
+  request.target = "/things/1";
+  EXPECT_EQ(handler(request).operation, "GetThing");
+}
+
 TEST(HealthEndpointTest, IgnoresTheQueryString) {
   auto handler = Chain({HealthEndpoint()}, [](const http::HttpRequest&) { return Ok("router"); });
   http::HttpRequest request;

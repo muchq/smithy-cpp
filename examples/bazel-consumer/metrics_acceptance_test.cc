@@ -82,9 +82,12 @@ class MetricsAcceptanceTest : public ::testing::Test {
         smithy::http::BeastServerTransport::Options{.threads = 1, .handler_threads = 4});
     // The composition the production guide documents, assembled here in
     // consumer code against the published targets alone.
+    // The liveness probe sits INSIDE the recorder, so probe traffic is
+    // counted — the arrangement that makes its operation label matter.
     ASSERT_TRUE(transport_
                     ->Start(smithy::server::Chain({smithy::server::MetricsEndpoint(metrics_),
-                                                   smithy::server::RecordMetrics(metrics_)},
+                                                   smithy::server::RecordMetrics(metrics_),
+                                                   smithy::server::HealthEndpoint("/livez")},
                                                   server_->Handler()))
                     .ok());
 
@@ -182,6 +185,42 @@ TEST_F(MetricsAcceptanceTest, AnUnroutedRequestCountsWithAnEmptyOperation) {
       << body;
   EXPECT_EQ(body.find("8f3a2b"), std::string::npos)
       << "the request target leaked into a label: " << body;
+}
+
+TEST_F(MetricsAcceptanceTest, AHealthProbeIsItsOwnSeriesNotAnAnonymous404) {
+  // Over a real socket, out of tree: the orchestrator's probe and a request
+  // for a route the model does not define must not share a series. They both
+  // miss the generated router, and before HealthEndpoint stamped its path
+  // both reported `operation=""` — so a service polled every few seconds had
+  // its 404 rate buried under probe volume and no query could separate them.
+  smithy::http::BeastHttpClient raw({.host = "127.0.0.1", .port = transport_->port()});
+  smithy::http::HttpRequest probe;
+  probe.method = "GET";
+  probe.target = "/livez";
+  const auto probed = raw.Send(probe);
+  ASSERT_TRUE(probed.ok()) << probed.error().message();
+  EXPECT_EQ(probed->status, 200);
+
+  smithy::http::HttpRequest unrouted;
+  unrouted.method = "GET";
+  unrouted.target = "/livez-typo";
+  ASSERT_TRUE(raw.Send(unrouted).ok());
+
+  const auto scrape = Scrape();
+  ASSERT_TRUE(scrape.ok()) << scrape.error().message();
+  const std::string& body = scrape->body;
+  EXPECT_NE(
+      body.find(R"(smithy_http_requests_total{method="GET",operation="/livez",status="200"} 1)"),
+      std::string::npos)
+      << body;
+  EXPECT_NE(body.find(R"(smithy_http_requests_total{method="GET",operation="",status="404"} 1)"),
+            std::string::npos)
+      << body;
+  // And the probe's latency is its own, so a service p99 can exclude it.
+  EXPECT_NE(
+      body.find(R"(smithy_http_request_duration_seconds_count{method="GET",operation="/livez"} 1)"),
+      std::string::npos)
+      << body;
 }
 
 TEST_F(MetricsAcceptanceTest, ApplicationMetricsShareTheEndpointWithTheBuiltIns) {

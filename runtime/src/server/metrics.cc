@@ -493,6 +493,9 @@ Middleware MetricsEndpoint(std::shared_ptr<MetricsRegistry> registry, std::strin
         // The version is part of the content type Prometheus negotiates on;
         // it names the exposition format, not this library.
         response.headers.Set("content-type", "text/plain; version=0.0.4; charset=utf-8");
+        // Only reached when this endpoint is composed inside the recorder
+        // instead of outside it; the documented order never records a scrape.
+        response.operation = path;
         // Set for HEAD too: the transport withholds the octets and keeps the
         // length (RFC 9110 §9.3.2), and that length is what the HEAD asked.
         response.body = registry->Expose();

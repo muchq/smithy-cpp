@@ -140,6 +140,12 @@ Middleware HealthEndpoint(std::string path, std::vector<ReadinessCheck> checks) 
         http::HttpResponse response;
         response.status = failing.empty() ? 200 : 503;
         response.headers.Set("content-type", "application/json");
+        // Probes are labeled with the endpoint's own path. Without it they
+        // report as the empty operation, which is also what 404s and 405s
+        // report — so probe traffic and dispatch failures land in one series
+        // and neither can be read. The path is fixed at composition, never
+        // off the wire, so this adds one series per composed endpoint.
+        response.operation = path;
         // Set for HEAD too. Framing is the transport's, which withholds the
         // octets and keeps the length (RFC 9110 §9.3.2); emptying the body
         // here would answer Content-Length: 0 instead — a false claim about

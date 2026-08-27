@@ -1,7 +1,7 @@
 plugins {
     // 7.2.x is the first Spotless line that documents Gradle 9 support;
     // pinned alongside CI's gradle-version bump.
-    id("com.diffplug.spotless") version "8.10.0" apply false
+    id("com.diffplug.spotless") version "8.10.1" apply false
 }
 
 subprojects {

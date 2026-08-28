@@ -377,11 +377,28 @@ needs no client library — it is a few lines of text over HTTP, so it costs
 zero dependencies. Two middleware compose around the generated handler:
 
 ```cpp
-auto metrics = std::make_shared<smithy::server::MetricsRegistry>();
+auto metrics = std::make_shared<smithy::server::MetricsRegistry>(
+    smithy::server::MetricsOptions{.enabled = true});
 transport.Start(smithy::server::Chain({smithy::server::MetricsEndpoint(metrics),
                                        smithy::server::RecordMetrics(metrics)},
                                       server.Handler()));
 ```
+
+**It is off unless you say otherwise.** `MetricsOptions::enabled` defaults to
+false, and a disabled registry is not a registry that records into a void: the
+two middleware compose to the *identity*, so nothing wraps the request path —
+no timing, no lock, not even an extra call frame — and `/metrics` reaches the
+router like any other unmodeled path and 404s. (A disabled endpoint answering
+an empty 200 would read to Prometheus as a live target reporting no series,
+which is exactly what a service whose metrics have gone silent looks like.)
+Handles from a disabled registry are inert rather than unusable, so
+application code never branches on the flag; only their *arguments* still
+cost anything, so guard a hot call site whose labels are themselves expensive
+with `metrics->enabled()`.
+
+Registration is not conditional on the flag. An invalid metric name, a type
+collision, or a bad bucket ladder aborts at startup either way (ADR-0009), so
+switching metrics on in production is never the first time those checks run.
 
 `RecordMetrics` is `Observe` wired to the registry, so request timing has one
 implementation and the scraped numbers cannot drift from the logged ones. The
@@ -412,6 +429,43 @@ standard HTTP set collapses to `other` rather than minting a series per
 invented verb. Past `max_series` combinations the registry stops minting and
 counts what it refused in `smithy_metrics_observations_dropped_total` — alert on
 that being non-zero rather than discovering the cap as an OOM.
+
+### Speaking another fleet's dialect
+
+An exposition format is a contract with whatever is already scraping, so the
+names, labels, units, and bucket ladder are all configurable on
+`MetricsOptions`. `MetricsOptions::Aura(service_name)` is a ready-made preset
+for [MoonBase](https://github.com/muchq/MoonBase)'s shared HTTP vocabulary,
+so a smithy-cpp service can replace an aura/futility, yodel, or server_pal one
+without touching a dashboard:
+
+```cpp
+auto options = smithy::server::MetricsOptions::Aura("todo-service");
+options.enabled = true;  // the preset does not turn it on for you
+auto metrics = std::make_shared<smithy::server::MetricsRegistry>(std::move(options));
+```
+
+It swaps in the five `http_server_*` families (`requests_total`,
+`requests_success_total`, `requests_failure_total`, `requests_active_gauge`,
+and `request_duration_microseconds`) with the descriptions that rail pins, the
+`service_name`/`http_method`/`route` label set, the `unmatched` and `/health`
+route vocabulary, the `CUSTOM` and `(unparsed)` method sentinels, and the
+microsecond bucket ladder the three MoonBase emitters share. Success and
+failure split at 400 and are derived from the same tally the total sums, so
+the three counters cannot disagree. The in-flight gauge carries no route on
+any rail — it moves at request start, before dispatch, where no bounded route
+exists — so it is labeled by method alone.
+
+Two things that composition still has to get right: compose `HealthEndpoint()`
+on its default `/health` path and *inside* `RecordMetrics`, because prom_proxy
+subtracts `route!="/health"` from every serving number and charts that route
+on its own tile — a service that never reports it reads as having no probe
+rather than as a healthy one. And point Prometheus at the service directly;
+the preset produces the collector's output shape without the collector.
+
+Every field is individually overridable for a fleet that speaks neither
+dialect. Names and label names are validated at construction, since one bad
+character yields a scrape Prometheus rejects in full.
 
 Your own metrics share the same scrape — one Prometheus target covers the
 service, rather than the built-in families sitting behind one endpoint and

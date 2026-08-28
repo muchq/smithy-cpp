@@ -1272,7 +1272,8 @@ TEST(BeastTransportTest, TheMetricsEndpointScrapesOverTheRealTransport) {
   // proves is that a scrape survives the transport — the exposition's own
   // content type reaches the client, and the traffic counted is the traffic
   // the transport actually served.
-  auto metrics = std::make_shared<smithy::server::MetricsRegistry>();
+  auto metrics = std::make_shared<smithy::server::MetricsRegistry>(
+      smithy::server::MetricsOptions{.enabled = true});
   BeastServerTransport server;
   ASSERT_TRUE(server
                   .Start(smithy::server::Chain({smithy::server::MetricsEndpoint(metrics),
@@ -1316,7 +1317,8 @@ TEST(BeastTransportTest, AnOverLimitRejectionReachesTheMetricsScrape) {
   // over-limit flood would be invisible in the request counters. Wiring
   // on_rejected is what makes it visible, and only a real transport proves
   // the wiring — the rejection has no in-process caller to fake.
-  auto metrics = std::make_shared<smithy::server::MetricsRegistry>();
+  auto metrics = std::make_shared<smithy::server::MetricsRegistry>(
+      smithy::server::MetricsOptions{.enabled = true});
   BeastServerTransport server(BeastServerTransport::Options{
       .max_body_bytes = 1024, .on_rejected = smithy::server::RecordRejections(metrics)});
   ASSERT_TRUE(server
@@ -1361,7 +1363,8 @@ TEST(BeastTransportTest, TheMetricsEndpointsHeadReportsTheGetsLength) {
   // Same framing hazard as the health endpoint below: MetricsEndpoint answers
   // HEAD itself, so it is on the handler to hand the transport a full body
   // and let the transport withhold the octets while keeping the length.
-  auto metrics = std::make_shared<smithy::server::MetricsRegistry>();
+  auto metrics = std::make_shared<smithy::server::MetricsRegistry>(
+      smithy::server::MetricsOptions{.enabled = true});
   BeastServerTransport server;
   ASSERT_TRUE(server
                   .Start(smithy::server::Chain({smithy::server::MetricsEndpoint(metrics)},

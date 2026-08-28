@@ -107,11 +107,22 @@ class Counter {
  public:
   void Increment(double amount = 1.0) { Increment(MetricLabels{}, amount); }
   void Increment(const MetricLabels& labels, double amount = 1.0) {
+    // A handle from a disabled registry holds no family. The branch is what
+    // makes an always-compiled call site free when metrics are off; the
+    // argument is not, so guard a hot call site whose labels are themselves
+    // expensive with MetricsRegistry::enabled().
+    if (family_ == nullptr) {
+      return;
+    }
     family_->Add(labels, amount, /*set=*/false);
   }
   // Exports this series as 0 from startup; see the zero-baseline note on
   // MetricsRegistry. Idempotent, and harmless once events have arrived.
-  void Declare(const MetricLabels& labels = {}) { family_->Declare(labels); }
+  void Declare(const MetricLabels& labels = {}) {
+    if (family_ != nullptr) {
+      family_->Declare(labels);
+    }
+  }
 
  private:
   friend class MetricsRegistry;
@@ -123,16 +134,27 @@ class Counter {
 class Gauge {
  public:
   void Set(double value) { Set(MetricLabels{}, value); }
-  void Set(const MetricLabels& labels, double value) { family_->Add(labels, value, /*set=*/true); }
+  void Set(const MetricLabels& labels, double value) {
+    // Inert when the registry is disabled; see Counter::Increment.
+    if (family_ != nullptr) {
+      family_->Add(labels, value, /*set=*/true);
+    }
+  }
   void Increment(double amount = 1.0) { Increment(MetricLabels{}, amount); }
   void Increment(const MetricLabels& labels, double amount = 1.0) {
-    family_->Add(labels, amount, /*set=*/false);
+    if (family_ != nullptr) {
+      family_->Add(labels, amount, /*set=*/false);
+    }
   }
   void Decrement(double amount = 1.0) { Increment(MetricLabels{}, -amount); }
   void Decrement(const MetricLabels& labels, double amount = 1.0) { Increment(labels, -amount); }
   // Exports this series as 0 from startup; see the zero-baseline note on
   // MetricsRegistry. Idempotent.
-  void Declare(const MetricLabels& labels = {}) { family_->Declare(labels); }
+  void Declare(const MetricLabels& labels = {}) {
+    if (family_ != nullptr) {
+      family_->Declare(labels);
+    }
+  }
 
  private:
   friend class MetricsRegistry;
@@ -144,18 +166,136 @@ class Gauge {
 class Histogram {
  public:
   void Observe(double value) { Observe(MetricLabels{}, value); }
-  void Observe(const MetricLabels& labels, double value) { family_->Observe(labels, value); }
+  void Observe(const MetricLabels& labels, double value) {
+    // Inert when the registry is disabled; see Counter::Increment.
+    if (family_ != nullptr) {
+      family_->Observe(labels, value);
+    }
+  }
   // Exports this series as an empty distribution — every bucket, `_sum` and
   // `_count` at 0 — from startup. Unlike a histogram behind a record-only
   // API, this is not an observation of 0: it adds nothing to `_sum` or
   // `_count`, so the windowed mean `rate(_sum)/rate(_count)` is unbiased.
   // Idempotent.
-  void Declare(const MetricLabels& labels = {}) { family_->Declare(labels); }
+  void Declare(const MetricLabels& labels = {}) {
+    if (family_ != nullptr) {
+      family_->Declare(labels);
+    }
+  }
 
  private:
   friend class MetricsRegistry;
   explicit Histogram(std::shared_ptr<internal::MetricFamily> family) : family_(std::move(family)) {}
   std::shared_ptr<internal::MetricFamily> family_;
+};
+
+// Which unit the built-in latency histogram records in. Seconds is
+// Prometheus's own base unit and the default; microseconds exists because a
+// fleet that already has microsecond dashboards cannot read seconds without
+// rewriting every query it has.
+enum class LatencyUnit { kSeconds, kMicroseconds };
+
+// The microsecond bucket ladder MoonBase's three emitter rails share
+// (MoonBase #1286, pinned equal across them by
+// //domains/platform/libs/otel_contract). Bucket layouts only compare like
+// with like: `histogram_quantile` reads `le` off bucket counts, so a service
+// joining an existing dashboard has to land on the same boundaries or its
+// quantiles are computed against a different ladder than everything beside
+// it. Use it with LatencyUnit::kMicroseconds.
+inline const std::vector<double>& AuraLatencyBuckets() {
+  static const std::vector<double> kBuckets = {100,    250,    500,     1000,    2500,
+                                               5000,   10000,  25000,   50000,   100000,
+                                               250000, 500000, 1000000, 2500000, 10000000};
+  return kBuckets;
+}
+
+// How a registry behaves and what its built-in families are called.
+//
+// `enabled` is false, so a registry costs nothing until something turns it
+// on. Disabled, RecordMetrics and MetricsEndpoint compose to the identity —
+// not a wrapper that checks a flag, but no wrapper at all, so a served
+// request runs the same call chain it would if metrics had never been
+// written. Registration still validates: a bad metric name or a type
+// collision aborts whether or not the registry is enabled, so switching it
+// on in production is never the first time those checks run.
+//
+// The names and labels are configurable because an exposition format is a
+// contract with whatever is already scraping. The defaults are this
+// library's own; MetricsOptions::Aura() is the vocabulary MoonBase's
+// dashboards read. Everything is individually overridable for a fleet that
+// speaks neither.
+struct MetricsOptions {
+  // Nothing is recorded, exposed, or composed until this is true.
+  bool enabled = false;
+
+  // Bounds the distinct {method,route,status} and {method,route}
+  // combinations retained, and separately the series of each application
+  // family; see the cardinality note on MetricsRegistry.
+  std::size_t max_series = 4096;
+
+  // Family names. An empty success/failure name means that family is not
+  // emitted at all — the default, since the status label already carries the
+  // outcome and `{status=~"5.."}` recovers it at query time.
+  std::string requests_total_name = "smithy_http_requests_total";
+  std::string requests_success_name{};
+  std::string requests_failure_name{};
+  std::string request_duration_name = "smithy_http_request_duration_seconds";
+  std::string requests_in_flight_name = "smithy_http_requests_in_flight";
+
+  // HELP text. Part of the contract when these names are shared with another
+  // emitter: a collector merging series by name keeps the first description
+  // it sees and logs a conflict for every later one that disagrees.
+  std::string requests_total_help =
+      "Total HTTP requests served, by method, Smithy operation, and status code.";
+  std::string requests_success_help = "HTTP requests completed successfully (2xx-3xx)";
+  std::string requests_failure_help = "HTTP requests that returned 4xx or 5xx";
+  std::string request_duration_help = "Request latency in seconds, by method and Smithy operation.";
+  std::string requests_in_flight_help = "Requests currently being served.";
+
+  // Label names. An empty status_label drops that label, which aggregates
+  // the counter over status codes — the shape to use when success and
+  // failure counters carry the outcome instead.
+  std::string method_label = "method";
+  std::string route_label = "operation";
+  std::string status_label = "status";
+
+  // Labels added to every built-in series, for a scrape that has to identify
+  // the service in the metric itself rather than in the scrape target — a
+  // dashboard selecting `{service_name="..."}` across a fleet, say.
+  MetricLabels constant_labels{};
+
+  // The in-flight gauge carries no route on purpose: it moves at request
+  // start, before dispatch, where nothing bounded is known about the path.
+  // It can still be labeled by method, which is known that early.
+  bool in_flight_by_method = false;
+
+  // The vocabulary for values the request itself did not supply. A request
+  // that reached no operation reports `unrouted_route`; a method outside the
+  // nine RFC 9110 verbs reports `nonstandard_method`; a request rejected
+  // before its method was parsed reports `unparsed_method`. All three are
+  // constants, which is what keeps the label set bounded.
+  std::string unrouted_route{};
+  std::string nonstandard_method = "other";
+  std::string unparsed_method = "unparsed";
+
+  LatencyUnit latency_unit = LatencyUnit::kSeconds;
+  std::vector<double> latency_buckets = DefaultLatencyBuckets();
+
+  // The exposition MoonBase's prom_proxy dashboards already query, so a
+  // smithy-cpp service can replace an aura/futility, yodel, or server_pal
+  // one without touching a dashboard: the five http_server_* families, the
+  // service_name/http_method/route label set, the route vocabulary
+  // ("unmatched" for unrouted, "/health" for the probe — which
+  // HealthEndpoint's default path already produces), the CUSTOM and
+  // (unparsed) method sentinels, and the shared microsecond bucket ladder.
+  //
+  // Still off unless you also set `enabled`.
+  //
+  // Compose HealthEndpoint() inside RecordMetrics for the probe route to
+  // exist at all: prom_proxy subtracts `route!="/health"` from every serving
+  // number and charts that route on its own tile, so a service that does not
+  // report it reads as having no probe rather than as a healthy one.
+  static MetricsOptions Aura(std::string service_name);
 };
 
 // A thread-safe aggregate of served requests, exposable as Prometheus text.
@@ -210,11 +350,13 @@ class Histogram {
 // sees the model.
 class MetricsRegistry {
  public:
-  // max_series bounds the distinct {method,operation,status} and
-  // {method,operation} combinations retained, and separately the series of
-  // each application family; see the cardinality note above.
-  explicit MetricsRegistry(std::size_t max_series = 4096,
-                           std::vector<double> latency_buckets = DefaultLatencyBuckets());
+  // Disabled unless `options.enabled`; see MetricsOptions.
+  explicit MetricsRegistry(MetricsOptions options = {});
+
+  // Whether this registry records anything. Worth branching on only around a
+  // call site whose label arguments are themselves expensive to build — the
+  // handles are already inert, and the built-in middleware compose away.
+  bool enabled() const { return options_.enabled; }
 
   // Feed from Observe's on_complete: counts the request, files its latency,
   // and decrements the in-flight gauge. Safe from concurrent request threads.
@@ -259,6 +401,7 @@ class MetricsRegistry {
                          std::vector<double> buckets = DefaultLatencyBuckets());
 
   // The Prometheus text exposition format (version 0.0.4), ready to serve.
+  // Empty when the registry is disabled.
   std::string Expose() const;
 
  private:
@@ -268,20 +411,20 @@ class MetricsRegistry {
 
   struct CountKey {
     std::string method;
-    std::string operation;
+    std::string route;
     int status = 0;
 
     friend bool operator<(const CountKey& a, const CountKey& b) {
-      return std::tie(a.method, a.operation, a.status) < std::tie(b.method, b.operation, b.status);
+      return std::tie(a.method, a.route, a.status) < std::tie(b.method, b.route, b.status);
     }
   };
 
   struct LatencyKey {
     std::string method;
-    std::string operation;
+    std::string route;
 
     friend bool operator<(const LatencyKey& a, const LatencyKey& b) {
-      return std::tie(a.method, a.operation) < std::tie(b.method, b.operation);
+      return std::tie(a.method, a.route) < std::tie(b.method, b.route);
     }
   };
 
@@ -290,16 +433,23 @@ class MetricsRegistry {
   // format also carries.
   struct HistogramData {
     std::vector<std::uint64_t> counts{};
-    double sum_seconds = 0.0;
+    // In whichever unit options_.latency_unit names.
+    double sum = 0.0;
     std::uint64_t count = 0;
   };
 
+  // Renders `{a="1",b="2"}` from the constant labels plus what is passed,
+  // dropping any pair whose name is empty. Callers hold mutex_.
+  std::string BuiltInLabels(const MetricLabels& labels) const;
+
+  MetricsOptions options_;
   mutable std::mutex mutex_;
-  std::size_t max_series_;
-  std::vector<double> buckets_;
   std::map<CountKey, std::uint64_t> counts_;
   std::map<LatencyKey, HistogramData> latencies_;
-  std::int64_t in_flight_ = 0;
+  // Always keyed by method, whether or not the gauge is exposed that way:
+  // the unlabeled form is the sum, and the key set is bounded by the method
+  // vocabulary.
+  std::map<std::string, std::int64_t> in_flight_;
   std::uint64_t observations_dropped_ = 0;
   // Sorted by name so each family's samples stay contiguous in the output.
   std::map<std::string, std::shared_ptr<internal::MetricFamily>> families_;
@@ -310,6 +460,11 @@ class MetricsRegistry {
 // implementation and cannot drift from what the logging hook reports. A null
 // registry aborts at composition time (ADR-0009) — a metrics endpoint that
 // silently reports nothing is worse than one that never starts.
+//
+// A disabled registry composes to the identity: the returned middleware
+// hands back the handler it was given, so nothing wraps the request path and
+// a served request pays nothing at all — no timing, no lock, not even an
+// extra call frame.
 Middleware RecordMetrics(std::shared_ptr<MetricsRegistry> registry);
 
 // A ready-made sink for `BeastServerTransport::Options::on_rejected`:
@@ -337,6 +492,12 @@ inline auto RecordRejections(std::shared_ptr<MetricsRegistry> registry) {
 // The response carries <path> as its HttpResponse::operation, which the
 // documented composition never reads — it matters only if you deliberately
 // put the endpoint inside the recorder to measure scrape volume.
+//
+// A disabled registry composes to the identity, so <path> is not served at
+// all — it reaches the router like any other unmodeled path, and answers
+// whatever that answers (a 404). A disabled endpoint that returned an empty
+// 200 would read to Prometheus as a live target reporting no series, which
+// is indistinguishable from a service whose metrics have all gone quiet.
 //
 // The endpoint is unauthenticated: it is middleware, so gate it the way you
 // gate anything else — compose Guard or RequireBearerAuth outside it, or

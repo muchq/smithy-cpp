@@ -75,8 +75,12 @@ class MetricsHandler final : public TodoHandler {
 
 class MetricsAcceptanceTest : public ::testing::Test {
  protected:
-  void SetUp() override {
-    metrics_ = std::make_shared<smithy::server::MetricsRegistry>();
+  void SetUp() override { Start(smithy::server::MetricsOptions{.enabled = true}); }
+
+  // Stands the service up under `options`, so a subclass can exercise a
+  // different dialect — or none at all — over the same real socket.
+  void Start(smithy::server::MetricsOptions options) {
+    metrics_ = std::make_shared<smithy::server::MetricsRegistry>(std::move(options));
     server_ = std::make_unique<TodoServer>(std::make_shared<MetricsHandler>(metrics_));
     transport_ = std::make_unique<smithy::http::BeastServerTransport>(
         smithy::http::BeastServerTransport::Options{.threads = 1, .handler_threads = 4});
@@ -266,3 +270,111 @@ TEST_F(MetricsAcceptanceTest, DeclaredSeriesAreOnTheScrapeBeforeAnyTraffic) {
 }
 
 }  // namespace
+
+// The MoonBase dialect, driven out of tree over a real socket. In-tree the
+// route label comes from hand-written handlers; here it comes from the
+// generated router, which is the only level at which "prom_proxy would find
+// this service's operations" is a claim about the model rather than about a
+// test fixture.
+class AuraMetricsAcceptanceTest : public MetricsAcceptanceTest {
+ protected:
+  void SetUp() override {
+    auto options = smithy::server::MetricsOptions::Aura("todo-service");
+    options.enabled = true;
+    Start(std::move(options));
+  }
+};
+
+TEST_F(AuraMetricsAcceptanceTest, TheGeneratedRoutersOperationIsTheRouteLabel) {
+  ASSERT_TRUE(client_->AddTask(AddTaskInput{.title = "ship it"}).ok());
+  ASSERT_FALSE(client_->GetTask(GetTaskInput{.taskId = "nope"}).ok());
+
+  const auto scrape = Scrape();
+  ASSERT_TRUE(scrape.ok()) << scrape.error().message();
+  const std::string& body = scrape->body;
+
+  // Exactly the series prom_proxy's `{service_name="todo-service"}` queries
+  // select, with the route coming from the Smithy model.
+  EXPECT_NE(body.find(R"(http_server_requests_total{service_name="todo-service",)"
+                      R"(http_method="POST",route="AddTask"} 1)"),
+            std::string::npos)
+      << body;
+  EXPECT_NE(body.find(R"(http_server_requests_success_total{service_name="todo-service",)"
+                      R"(http_method="POST",route="AddTask"} 1)"),
+            std::string::npos)
+      << body;
+  // The modeled error is a failure by the 400 boundary the dashboards use.
+  EXPECT_NE(body.find(R"(http_server_requests_failure_total{service_name="todo-service",)"
+                      R"(http_method="GET",route="GetTask"} 1)"),
+            std::string::npos)
+      << body;
+  EXPECT_NE(body.find(R"(http_server_request_duration_microseconds_count{)"
+                      R"(service_name="todo-service",http_method="POST",route="AddTask"} 1)"),
+            std::string::npos)
+      << body;
+  EXPECT_NE(body.find("http_server_requests_active_gauge{service_name=\"todo-service\""),
+            std::string::npos)
+      << body;
+  // The default dialect is gone, not emitted alongside.
+  EXPECT_EQ(body.find("smithy_http_"), std::string::npos) << body;
+}
+
+TEST_F(AuraMetricsAcceptanceTest, TheProbeRouteThePanelsSubtractIsReported) {
+  // This fixture composes HealthEndpoint("/livez"), so the probe reports
+  // route="/livez". Under prom_proxy's fleet convention the endpoint would
+  // be composed on its default "/health" and the Probes tile would find it;
+  // what this pins is that the probe gets a route of its own rather than
+  // joining unmatched traffic, which is what makes the subtraction possible
+  // at all.
+  smithy::http::BeastHttpClient raw({.host = "127.0.0.1", .port = transport_->port()});
+  smithy::http::HttpRequest probe;
+  probe.method = "GET";
+  probe.target = "/livez";
+  ASSERT_TRUE(raw.Send(probe).ok());
+
+  smithy::http::HttpRequest unrouted;
+  unrouted.method = "GET";
+  unrouted.target = "/nope";
+  ASSERT_TRUE(raw.Send(unrouted).ok());
+
+  const auto scrape = Scrape();
+  ASSERT_TRUE(scrape.ok()) << scrape.error().message();
+  const std::string& body = scrape->body;
+  EXPECT_NE(body.find(R"(http_server_requests_total{service_name="todo-service",)"
+                      R"(http_method="GET",route="/livez"} 1)"),
+            std::string::npos)
+      << body;
+  // Unrouted traffic parks on the sentinel the rails agreed on — never the
+  // empty string, which `route!="/health"` would match into the serving
+  // numbers.
+  EXPECT_NE(body.find(R"(http_server_requests_total{service_name="todo-service",)"
+                      R"(http_method="GET",route="unmatched"} 1)"),
+            std::string::npos)
+      << body;
+  EXPECT_EQ(body.find(R"(route="")"), std::string::npos) << body;
+}
+
+// Off is the default, so this is what a consumer gets by linking the metrics
+// stack without asking for it.
+class DisabledMetricsAcceptanceTest : public MetricsAcceptanceTest {
+ protected:
+  void SetUp() override { Start(smithy::server::MetricsOptions{}); }
+};
+
+TEST_F(DisabledMetricsAcceptanceTest, TheScrapePathIsNotServedAndTheServiceStillWorks) {
+  // The endpoint composed away, so /metrics is just a path the model does
+  // not define. A 200 with an empty body would look to Prometheus like a
+  // healthy target reporting nothing — the same picture as a service whose
+  // metrics have gone silent.
+  const auto scrape = Scrape();
+  ASSERT_TRUE(scrape.ok()) << scrape.error().message();
+  EXPECT_EQ(scrape->status, 404);
+  EXPECT_EQ(scrape->body.find("http_server_"), std::string::npos) << scrape->body;
+  EXPECT_EQ(scrape->body.find("smithy_http_"), std::string::npos) << scrape->body;
+
+  // And the recorder composed away too, without disturbing the service or
+  // the handler's own metric handles, which are inert rather than unusable.
+  const auto added = client_->AddTask(AddTaskInput{.title = "still works"});
+  ASSERT_TRUE(added.ok()) << added.error().message();
+  EXPECT_EQ(added->taskId, "task-1");
+}

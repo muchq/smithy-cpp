@@ -31,8 +31,31 @@ policy in [docs/versioning.md](docs/versioning.md).
   counter's invisible first sample. `RecordRejections` feeds
   `BeastServerTransport::Options::on_rejected`, so the 413/431 the transport
   writes before any middleware exists are counted too — without filing a
-  zero latency that would flatter the panel during an over-limit flood. See the Observability section of
-  [docs/production-guide.md](docs/production-guide.md).
+  zero latency that would flatter the panel during an over-limit flood.
+
+  The whole stack is **off unless `MetricsOptions::enabled` says otherwise**,
+  and off means absent rather than idle: `RecordMetrics` and `MetricsEndpoint`
+  compose to the identity, so a disabled registry puts no wrapper on the
+  request path and `/metrics` 404s through to the router rather than serving
+  an empty scrape that would read as a live target with nothing to report.
+  Handles from a disabled registry are inert rather than unusable, so
+  application code never branches on the flag. Registration is deliberately
+  *not* conditional on it — an invalid name, a type collision, or a bad bucket
+  ladder aborts at startup either way, so enabling metrics in production is
+  never the first time those checks run.
+
+  Names, labels, units and buckets are configurable, because an exposition
+  format is a contract with whatever is already scraping.
+  `MetricsOptions::Aura(service_name)` is a ready-made preset for
+  [MoonBase](https://github.com/muchq/MoonBase)'s shared HTTP vocabulary — the
+  five `http_server_*` families, the `service_name`/`http_method`/`route` label
+  set, the `unmatched` and `/health` route sentinels, the `CUSTOM` and
+  `(unparsed)` method sentinels, and the microsecond bucket ladder its three
+  emitter rails pin equal — so a smithy-cpp service can replace an
+  aura/futility, yodel, or server_pal one without touching a dashboard.
+  Success and failure counters are derived from the same status-keyed tally
+  the total sums, so the three cannot disagree. See the Observability section
+  of [docs/production-guide.md](docs/production-guide.md).
 
 ### Fixed
 

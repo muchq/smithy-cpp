@@ -21,7 +21,7 @@ bazel_dep(name = "boost.asio", version = "1.90.0.bcr.1")
 # bumps deliberately, never as an MVS side effect.
 bazel_dep(name = "boringssl", version = "0.20260730.0")
 bazel_dep(name = "boost.beast", version = "1.90.0.bcr.1")
-bazel_dep(name = "nlohmann_json", version = "3.12.0.bcr.1")
+bazel_dep(name = "nlohmann_json", version = "3.12.0.bcr.2")
 bazel_dep(name = "zlib", version = "1.3.2")
 
 bazel_dep(name = "rules_shell", version = "0.8.0", dev_dependency = True)

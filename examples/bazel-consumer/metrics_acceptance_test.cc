@@ -140,17 +140,15 @@ TEST_F(MetricsAcceptanceTest, TheGeneratedRoutersOperationIsTheMetricLabel) {
   // not from anything this test stamped.
   EXPECT_NE(body.find(R"(operation="AddTask")"), std::string::npos) << body;
   EXPECT_NE(body.find(R"(operation="GetTask")"), std::string::npos) << body;
-  EXPECT_NE(
-      body.find(R"(smithy_http_requests_total{method="POST",operation="AddTask",status="200"} 2)"),
-      std::string::npos)
+  EXPECT_NE(body.find(R"(http_requests_total{method="POST",operation="AddTask",status="200"} 2)"),
+            std::string::npos)
       << body;
   // The modeled error is served traffic too, under its own status.
   EXPECT_NE(body.find(R"(operation="GetTask",status="404")"), std::string::npos) << body;
 
   // Latency was filed under the same operation label, with a real total.
   EXPECT_NE(
-      body.find(
-          R"(smithy_http_request_duration_seconds_count{method="POST",operation="AddTask"} 2)"),
+      body.find(R"(http_request_duration_seconds_count{method="POST",operation="AddTask"} 2)"),
       std::string::npos)
       << body;
 }
@@ -167,7 +165,7 @@ TEST_F(MetricsAcceptanceTest, ScrapesDoNotCountThemselvesAndLeaveNothingInFlight
   // GET series of their own.
   EXPECT_EQ(body.find(R"(method="GET")"), std::string::npos) << body;
   // Every request that started also finished.
-  EXPECT_NE(body.find("smithy_http_requests_in_flight 0"), std::string::npos) << body;
+  EXPECT_NE(body.find("http_requests_in_flight 0"), std::string::npos) << body;
 }
 
 TEST_F(MetricsAcceptanceTest, AnUnroutedRequestCountsWithAnEmptyOperation) {
@@ -184,7 +182,7 @@ TEST_F(MetricsAcceptanceTest, AnUnroutedRequestCountsWithAnEmptyOperation) {
   const auto scrape = Scrape();
   ASSERT_TRUE(scrape.ok()) << scrape.error().message();
   const std::string& body = scrape->body;
-  EXPECT_NE(body.find(R"(smithy_http_requests_total{method="GET",operation="",status="404"} 1)"),
+  EXPECT_NE(body.find(R"(http_requests_total{method="GET",operation="",status="404"} 1)"),
             std::string::npos)
       << body;
   EXPECT_EQ(body.find("8f3a2b"), std::string::npos)
@@ -213,17 +211,15 @@ TEST_F(MetricsAcceptanceTest, AHealthProbeIsItsOwnSeriesNotAnAnonymous404) {
   const auto scrape = Scrape();
   ASSERT_TRUE(scrape.ok()) << scrape.error().message();
   const std::string& body = scrape->body;
-  EXPECT_NE(
-      body.find(R"(smithy_http_requests_total{method="GET",operation="/livez",status="200"} 1)"),
-      std::string::npos)
+  EXPECT_NE(body.find(R"(http_requests_total{method="GET",operation="/livez",status="200"} 1)"),
+            std::string::npos)
       << body;
-  EXPECT_NE(body.find(R"(smithy_http_requests_total{method="GET",operation="",status="404"} 1)"),
+  EXPECT_NE(body.find(R"(http_requests_total{method="GET",operation="",status="404"} 1)"),
             std::string::npos)
       << body;
   // And the probe's latency is its own, so a service p99 can exclude it.
-  EXPECT_NE(
-      body.find(R"(smithy_http_request_duration_seconds_count{method="GET",operation="/livez"} 1)"),
-      std::string::npos)
+  EXPECT_NE(body.find(R"(http_request_duration_seconds_count{method="GET",operation="/livez"} 1)"),
+            std::string::npos)
       << body;
 }
 
@@ -315,8 +311,9 @@ TEST_F(AuraMetricsAcceptanceTest, TheGeneratedRoutersOperationIsTheRouteLabel) {
   EXPECT_NE(body.find("http_server_requests_active_gauge{service_name=\"todo-service\""),
             std::string::npos)
       << body;
-  // The default dialect is gone, not emitted alongside.
-  EXPECT_EQ(body.find("smithy_http_"), std::string::npos) << body;
+  // The default dialect is replaced, not emitted alongside.
+  EXPECT_EQ(body.find("http_request_duration_seconds"), std::string::npos) << body;
+  EXPECT_EQ(body.find("http_requests_in_flight"), std::string::npos) << body;
 }
 
 TEST_F(AuraMetricsAcceptanceTest, TheProbeRouteThePanelsSubtractIsReported) {
@@ -370,7 +367,7 @@ TEST_F(DisabledMetricsAcceptanceTest, TheScrapePathIsNotServedAndTheServiceStill
   ASSERT_TRUE(scrape.ok()) << scrape.error().message();
   EXPECT_EQ(scrape->status, 404);
   EXPECT_EQ(scrape->body.find("http_server_"), std::string::npos) << scrape->body;
-  EXPECT_EQ(scrape->body.find("smithy_http_"), std::string::npos) << scrape->body;
+  EXPECT_EQ(scrape->body.find("http_requests_total"), std::string::npos) << scrape->body;
 
   // And the recorder composed away too, without disturbing the service or
   // the handler's own metric handles, which are inert rather than unusable.

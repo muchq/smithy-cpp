@@ -407,10 +407,10 @@ scrapes answer without being counted as served traffic — swap them and every
 scrape inflates your own request rate, at whatever interval Prometheus polls.
 
 Three families are exposed on `/metrics` (path configurable):
-`smithy_http_requests_total{method,operation,status}`,
-`smithy_http_request_duration_seconds{method,operation}` (a histogram, so
+`http_requests_total{method,operation,status}`,
+`http_request_duration_seconds{method,operation}` (a histogram, so
 `histogram_quantile` gives you tail latency), and
-`smithy_http_requests_in_flight`.
+`http_requests_in_flight`.
 
 The label set is bounded by construction, because cardinality is what
 actually kills a metrics endpoint. `target` is deliberately *not* a label —
@@ -427,7 +427,7 @@ compose the probes inside `RecordMetrics` if you want them counted, outside
 it if you do not. `method` arrives from the wire, so anything outside the
 standard HTTP set collapses to `other` rather than minting a series per
 invented verb. Past `max_series` combinations the registry stops minting and
-counts what it refused in `smithy_metrics_observations_dropped_total` — alert on
+counts what it refused in `metrics_observations_dropped_total` — alert on
 that being non-zero rather than discovering the cap as an OOM.
 
 ### Speaking another fleet's dialect
@@ -500,7 +500,7 @@ wrong: label values are escaped, labels are sorted so `{a,b}` and `{b,a}` are
 one series rather than two, and the same per-family cap applies — a label
 taken from unbounded data (a user id) costs that family its series budget and
 is attributed on
-`smithy_metrics_observations_dropped_total{metric="..."}` instead of taking
+`metrics_observations_dropped_total{metric="..."}` instead of taking
 the process down. A metric name that isn't a valid Prometheus name, or that
 collides with an existing family under a different type, aborts at
 registration: both produce a scrape Prometheus rejects in full, and nothing

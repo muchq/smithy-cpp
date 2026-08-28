@@ -36,11 +36,14 @@ namespace smithy::server {
 // RecordMetrics first instead and every scrape inflates your own request
 // rate — at whatever interval Prometheus polls.
 //
-// The metric families, all prefixed `smithy_http_`:
+// The built-in families, under Prometheus's own conventional names — the
+// library is not what is being measured, so it does not appear in them:
 //
-//   requests_total{method,operation,status}    counter
-//   request_duration_seconds{method,operation} histogram (+ _sum, _count)
-//   requests_in_flight                         gauge
+//   http_requests_total{method,operation,status}    counter
+//   http_request_duration_seconds{method,operation} histogram (+ _sum/_count)
+//   http_requests_in_flight                         gauge
+//
+// All of them are configurable; see MetricsOptions.
 //
 // Status is the exact code rather than a class: it is bounded either way,
 // and `{status=~"5.."}` recovers the class at query time while the reverse
@@ -49,7 +52,7 @@ namespace smithy::server {
 // Application metrics join the same scrape through NewCounter / NewGauge /
 // NewHistogram; see MetricsRegistry below.
 
-// The bucket boundaries of `smithy_http_request_duration_seconds`, in
+// The bucket boundaries of `http_request_duration_seconds`, in
 // seconds — Prometheus's own default ladder, which is tuned for exactly this
 // shape of measurement (sub-millisecond to ten seconds).
 inline const std::vector<double>& DefaultLatencyBuckets() {
@@ -236,11 +239,15 @@ struct MetricsOptions {
   // Family names. An empty success/failure name means that family is not
   // emitted at all — the default, since the status label already carries the
   // outcome and `{status=~"5.."}` recovers it at query time.
-  std::string requests_total_name = "smithy_http_requests_total";
+  std::string requests_total_name = "http_requests_total";
   std::string requests_success_name{};
   std::string requests_failure_name{};
-  std::string request_duration_name = "smithy_http_request_duration_seconds";
-  std::string requests_in_flight_name = "smithy_http_requests_in_flight";
+  std::string request_duration_name = "http_request_duration_seconds";
+  std::string requests_in_flight_name = "http_requests_in_flight";
+  // The registry's own health: observations refused after a family hit the
+  // series cap. Alert on it being non-zero rather than discovering the cap
+  // as an OOM.
+  std::string observations_dropped_name = "metrics_observations_dropped_total";
 
   // HELP text. Part of the contract when these names are shared with another
   // emitter: a collector merging series by name keeps the first description
@@ -251,6 +258,8 @@ struct MetricsOptions {
   std::string requests_failure_help = "HTTP requests that returned 4xx or 5xx";
   std::string request_duration_help = "Request latency in seconds, by method and Smithy operation.";
   std::string requests_in_flight_help = "Requests currently being served.";
+  std::string observations_dropped_help =
+      "Observations dropped after the registry hit its series cap.";
 
   // Label names. An empty status_label drops that label, which aggregates
   // the counter over status codes — the shape to use when success and
@@ -314,7 +323,7 @@ struct MetricsOptions {
 //     minting a series per invented verb.
 //   - Past `max_series` distinct label combinations the registry stops
 //     minting new ones and counts each refused observation once in
-//     `smithy_metrics_observations_dropped_total`. With the two rules above
+//     `metrics_observations_dropped_total`. With the two rules above
 //     the cap should be unreachable; it is the backstop for a handler that
 //     stamps its own unbounded operation, and it fails visibly (a counter
 //     you can alert on) rather than by exhausting memory.

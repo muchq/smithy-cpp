@@ -11,9 +11,9 @@ policy in [docs/versioning.md](docs/versioning.md).
 - **A dependency-free Prometheus `/metrics` endpoint** (#91, first work
   item). `smithy::server::MetricsRegistry` aggregates the existing `Observe`
   hooks into three families —
-  `smithy_http_requests_total{method,operation,status}`,
-  `smithy_http_request_duration_seconds{method,operation}` (histogram), and
-  `smithy_http_requests_in_flight` — and `MetricsEndpoint` serves them in the
+  `http_requests_total{method,operation,status}`,
+  `http_request_duration_seconds{method,operation}` (histogram), and
+  `http_requests_in_flight` — and `MetricsEndpoint` serves them in the
   text exposition format, which needs no client library and so costs zero new
   dependencies. `RecordMetrics` is `Observe` wired to a registry, so request
   timing keeps one implementation and the scraped numbers cannot drift from
@@ -23,7 +23,7 @@ policy in [docs/versioning.md](docs/versioning.md).
   query strings would mint a series per request id), an off-wire `method`
   outside the standard set collapses to `other`, and a series cap backstops
   anything unforeseen while counting what it refused in
-  `smithy_metrics_observations_dropped_total`. Application metrics join the
+  `metrics_observations_dropped_total`. Application metrics join the
   same scrape through `NewCounter` / `NewGauge` / `NewHistogram`, so one
   Prometheus target covers the service; the registry keeps owning escaping,
   label ordering, and the per-family cap. `Declare` exports a known series at
@@ -43,6 +43,12 @@ policy in [docs/versioning.md](docs/versioning.md).
   *not* conditional on it — an invalid name, a type collision, or a bad bucket
   ladder aborts at startup either way, so enabling metrics in production is
   never the first time those checks run.
+
+  The built-in families are `http_requests_total`,
+  `http_request_duration_seconds` and `http_requests_in_flight`, under
+  Prometheus's own conventional names rather than a library prefix: what is
+  being measured is HTTP traffic, and Smithy is the IDL the service is
+  described in, not a property of the request being counted.
 
   Names, labels, units and buckets are configurable, because an exposition
   format is a contract with whatever is already scraping.

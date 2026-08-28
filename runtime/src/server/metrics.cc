@@ -261,8 +261,9 @@ MetricsRegistry::MetricsRegistry(MetricsOptions options) : options_(std::move(op
   // Every configured name reaches the exposition verbatim, so an invalid one
   // yields a scrape Prometheus rejects in full — with no in-process consumer
   // to notice. The success and failure names are optional; the rest are not.
-  for (const std::string* name : {&options_.requests_total_name, &options_.request_duration_name,
-                                  &options_.requests_in_flight_name}) {
+  for (const std::string* name :
+       {&options_.requests_total_name, &options_.request_duration_name,
+        &options_.requests_in_flight_name, &options_.observations_dropped_name}) {
     if (!ValidName(*name, /*allow_colon=*/true)) {
       smithy::internal::Fatal("smithy::server::MetricsRegistry: invalid metric name '" + *name +
                               "'");
@@ -436,8 +437,7 @@ std::shared_ptr<internal::MetricFamily> MetricsRegistry::Register(std::string na
   for (const std::string& reserved :
        {options_.requests_total_name, options_.requests_success_name,
         options_.requests_failure_name, options_.request_duration_name,
-        options_.requests_in_flight_name,
-        std::string("smithy_metrics_observations_dropped_total")}) {
+        options_.requests_in_flight_name, options_.observations_dropped_name}) {
     if (!reserved.empty() && name == reserved) {
       smithy::internal::Fatal("smithy::server::MetricsRegistry: '" + name +
                               "' is one of the built-in families");
@@ -599,11 +599,10 @@ std::string MetricsRegistry::Expose() const {
                  std::to_string(total));
   }
 
-  AppendFamilyHeader(out, "smithy_metrics_observations_dropped_total", "counter",
-                     "Observations dropped after the registry hit its series cap.");
-  out += "smithy_metrics_observations_dropped_total ";
-  out += std::to_string(observations_dropped_);
-  out += '\n';
+  AppendFamilyHeader(out, options_.observations_dropped_name, "counter",
+                     options_.observations_dropped_help);
+  AppendSample(out, options_.observations_dropped_name, "", BuiltInLabels({}),
+               std::to_string(observations_dropped_));
   // Application families last, each whole and in name order; their samples
   // are already keyed by rendered labels, so a family's series are
   // contiguous the way the format requires. `dropped` rides on the family's
@@ -638,9 +637,8 @@ std::string MetricsRegistry::Expose() const {
       AppendSample(out, name, "_count", labels, std::to_string(sample.count));
     }
     if (family->dropped != 0) {
-      out += "smithy_metrics_observations_dropped_total{metric=\"" + EscapeLabel(name) + "\"} ";
-      out += std::to_string(family->dropped);
-      out += '\n';
+      AppendSample(out, options_.observations_dropped_name, "", BuiltInLabels({{"metric", name}}),
+                   std::to_string(family->dropped));
     }
   }
   return out;

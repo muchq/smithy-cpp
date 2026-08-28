@@ -80,13 +80,11 @@ TEST(MetricsRegistryTest, CountsRequestsByMethodOperationAndStatus) {
   registry.Record(Served("POST", "PutThing", 500, microseconds(3000)));
 
   const std::string exposition = registry.Expose();
-  EXPECT_TRUE(
-      HasLine(exposition,
-              R"(smithy_http_requests_total{method="GET",operation="GetThing",status="200"} 2)"))
+  EXPECT_TRUE(HasLine(exposition,
+                      R"(http_requests_total{method="GET",operation="GetThing",status="200"} 2)"))
       << exposition;
-  EXPECT_TRUE(
-      HasLine(exposition,
-              R"(smithy_http_requests_total{method="POST",operation="PutThing",status="500"} 1)"))
+  EXPECT_TRUE(HasLine(exposition,
+                      R"(http_requests_total{method="POST",operation="PutThing",status="500"} 1)"))
       << exposition;
 }
 
@@ -94,11 +92,10 @@ TEST(MetricsRegistryTest, EmitsTheFamilyHeadersEvenBeforeAnyTraffic) {
   // A freshly started server should still describe its shape, so a scrape
   // configured against it is verifiable before the first request arrives.
   const std::string exposition = MetricsRegistry(Enabled()).Expose();
-  EXPECT_TRUE(HasLine(exposition, "# TYPE smithy_http_requests_total counter")) << exposition;
-  EXPECT_TRUE(HasLine(exposition, "# TYPE smithy_http_request_duration_seconds histogram"))
-      << exposition;
-  EXPECT_TRUE(HasLine(exposition, "# TYPE smithy_http_requests_in_flight gauge")) << exposition;
-  EXPECT_TRUE(HasLine(exposition, "smithy_http_requests_in_flight 0")) << exposition;
+  EXPECT_TRUE(HasLine(exposition, "# TYPE http_requests_total counter")) << exposition;
+  EXPECT_TRUE(HasLine(exposition, "# TYPE http_request_duration_seconds histogram")) << exposition;
+  EXPECT_TRUE(HasLine(exposition, "# TYPE http_requests_in_flight gauge")) << exposition;
+  EXPECT_TRUE(HasLine(exposition, "http_requests_in_flight 0")) << exposition;
 }
 
 TEST(MetricsRegistryTest, HistogramBucketsAreCumulativeAndEndAtInf) {
@@ -111,19 +108,19 @@ TEST(MetricsRegistryTest, HistogramBucketsAreCumulativeAndEndAtInf) {
 
   const std::string exposition = registry.Expose();
   const std::string labels = R"(method="GET",operation="GetThing")";
-  EXPECT_TRUE(HasLine(exposition,
-                      "smithy_http_request_duration_seconds_bucket{" + labels + R"(,le="0.01"} 1)"))
+  EXPECT_TRUE(
+      HasLine(exposition, "http_request_duration_seconds_bucket{" + labels + R"(,le="0.01"} 1)"))
       << exposition;
-  EXPECT_TRUE(HasLine(exposition,
-                      "smithy_http_request_duration_seconds_bucket{" + labels + R"(,le="0.1"} 2)"))
+  EXPECT_TRUE(
+      HasLine(exposition, "http_request_duration_seconds_bucket{" + labels + R"(,le="0.1"} 2)"))
       << exposition;
-  EXPECT_TRUE(HasLine(exposition,
-                      "smithy_http_request_duration_seconds_bucket{" + labels + R"(,le="+Inf"} 3)"))
+  EXPECT_TRUE(
+      HasLine(exposition, "http_request_duration_seconds_bucket{" + labels + R"(,le="+Inf"} 3)"))
       << exposition;
-  EXPECT_TRUE(HasLine(exposition, "smithy_http_request_duration_seconds_count{" + labels + "} 3"))
+  EXPECT_TRUE(HasLine(exposition, "http_request_duration_seconds_count{" + labels + "} 3"))
       << exposition;
   // 0.005 + 0.05 + 0.5, formatted without trailing-zero noise.
-  EXPECT_TRUE(HasLine(exposition, "smithy_http_request_duration_seconds_sum{" + labels + "} 0.555"))
+  EXPECT_TRUE(HasLine(exposition, "http_request_duration_seconds_sum{" + labels + "} 0.555"))
       << exposition;
 }
 
@@ -132,9 +129,9 @@ TEST(MetricsRegistryTest, SubMillisecondLatenciesSurviveTheMicrosecondHook) {
   // report as zero (#92); the seconds conversion must not undo that.
   MetricsRegistry registry(Enabled());
   registry.Record(Served("GET", "GetThing", 200, microseconds(1)));
-  EXPECT_TRUE(HasLine(
-      registry.Expose(),
-      R"(smithy_http_request_duration_seconds_sum{method="GET",operation="GetThing"} 0.000001)"))
+  EXPECT_TRUE(
+      HasLine(registry.Expose(),
+              R"(http_request_duration_seconds_sum{method="GET",operation="GetThing"} 0.000001)"))
       << registry.Expose();
 }
 
@@ -145,7 +142,7 @@ TEST(MetricsRegistryTest, DispatchFailuresCountUnderAnEmptyOperation) {
   MetricsRegistry registry(Enabled());
   registry.Record(Served("GET", "", 404, microseconds(100)));
   EXPECT_TRUE(HasLine(registry.Expose(),
-                      R"(smithy_http_requests_total{method="GET",operation="",status="404"} 1)"))
+                      R"(http_requests_total{method="GET",operation="",status="404"} 1)"))
       << registry.Expose();
 }
 
@@ -165,10 +162,9 @@ TEST(MetricsRegistryTest, RecordsConcurrentlyWithoutLosingCounts) {
   for (std::thread& thread : threads) {
     thread.join();
   }
-  EXPECT_TRUE(
-      HasLine(registry.Expose(),
-              R"(smithy_http_requests_total{method="GET",operation="GetThing",status="200"} )" +
-                  std::to_string(kThreads * kPerThread)))
+  EXPECT_TRUE(HasLine(registry.Expose(),
+                      R"(http_requests_total{method="GET",operation="GetThing",status="200"} )" +
+                          std::to_string(kThreads * kPerThread)))
       << registry.Expose();
 }
 
@@ -184,8 +180,8 @@ TEST(MetricsRegistryTest, AnInventedMethodCollapsesInsteadOfMintingASeries) {
     registry.Record(Served("BOGUS" + std::to_string(i), "", 405, microseconds(10)));
   }
   const std::string exposition = registry.Expose();
-  EXPECT_TRUE(HasLine(
-      exposition, R"(smithy_http_requests_total{method="other",operation="",status="405"} 100)"))
+  EXPECT_TRUE(
+      HasLine(exposition, R"(http_requests_total{method="other",operation="",status="405"} 100)"))
       << exposition;
   EXPECT_EQ(exposition.find("BOGUS"), std::string::npos) << exposition;
 }
@@ -196,8 +192,8 @@ TEST(MetricsRegistryTest, LowercaseMethodIsNotFoldedIntoTheRealOne) {
   MetricsRegistry registry(Enabled());
   registry.Record(Served("get", "", 405, microseconds(10)));
   const std::string exposition = registry.Expose();
-  EXPECT_TRUE(HasLine(exposition,
-                      R"(smithy_http_requests_total{method="other",operation="",status="405"} 1)"))
+  EXPECT_TRUE(
+      HasLine(exposition, R"(http_requests_total{method="other",operation="",status="405"} 1)"))
       << exposition;
 }
 
@@ -212,13 +208,13 @@ TEST(MetricsRegistryTest, TheSeriesCapStopsGrowthAndSaysSoOutLoud) {
     registry.Record(Served("GET", "Op" + std::to_string(i), 200, microseconds(10)));
   }
   const std::string exposition = registry.Expose();
-  EXPECT_TRUE(HasLine(exposition,
-                      R"(smithy_http_requests_total{method="GET",operation="Op0",status="200"} 1)"))
+  EXPECT_TRUE(
+      HasLine(exposition, R"(http_requests_total{method="GET",operation="Op0",status="200"} 1)"))
       << exposition;
   EXPECT_EQ(exposition.find(R"(operation="Op49")"), std::string::npos) << exposition;
   // Four combinations fit; the remaining 46 observations are refused, and
   // each is counted exactly once even though both families turned it away.
-  EXPECT_TRUE(HasLine(exposition, "smithy_metrics_observations_dropped_total 46")) << exposition;
+  EXPECT_TRUE(HasLine(exposition, "metrics_observations_dropped_total 46")) << exposition;
 }
 
 TEST(MetricsRegistryTest, LabelValuesAreEscapedSoTheScrapeStaysParseable) {
@@ -228,7 +224,7 @@ TEST(MetricsRegistryTest, LabelValuesAreEscapedSoTheScrapeStaysParseable) {
   registry.Record(Served("GET", R"(We"ird\Op)", 200, microseconds(10)));
   EXPECT_TRUE(
       HasLine(registry.Expose(),
-              R"(smithy_http_requests_total{method="GET",operation="We\"ird\\Op",status="200"} 1)"))
+              R"(http_requests_total{method="GET",operation="We\"ird\\Op",status="200"} 1)"))
       << registry.Expose();
 }
 
@@ -240,10 +236,10 @@ TEST(MetricsRegistryTest, InFlightRisesOnStartAndFallsOnCompletion) {
   MetricsRegistry registry(Enabled());
   registry.RecordStart(RequestStart{.method = "GET", .target = "/a"});
   registry.RecordStart(RequestStart{.method = "GET", .target = "/b"});
-  EXPECT_TRUE(HasLine(registry.Expose(), "smithy_http_requests_in_flight 2")) << registry.Expose();
+  EXPECT_TRUE(HasLine(registry.Expose(), "http_requests_in_flight 2")) << registry.Expose();
 
   registry.Record(Served("GET", "GetThing", 200, microseconds(10)));
-  EXPECT_TRUE(HasLine(registry.Expose(), "smithy_http_requests_in_flight 1")) << registry.Expose();
+  EXPECT_TRUE(HasLine(registry.Expose(), "http_requests_in_flight 1")) << registry.Expose();
 }
 
 TEST(MetricsRegistryTest, CompletionsWithoutStartsLeaveTheGaugeAtZero) {
@@ -252,7 +248,7 @@ TEST(MetricsRegistryTest, CompletionsWithoutStartsLeaveTheGaugeAtZero) {
   MetricsRegistry registry(Enabled());
   registry.Record(Served("GET", "GetThing", 200, microseconds(10)));
   registry.Record(Served("GET", "GetThing", 200, microseconds(10)));
-  EXPECT_TRUE(HasLine(registry.Expose(), "smithy_http_requests_in_flight 0")) << registry.Expose();
+  EXPECT_TRUE(HasLine(registry.Expose(), "http_requests_in_flight 0")) << registry.Expose();
 }
 
 // ---------------------------------------------------------------------------
@@ -266,7 +262,7 @@ TEST(MetricsRegistryTest, ARejectionIsCountedLikeAnyOtherServedRequest) {
   registry.RecordRejection("POST", 413);
   registry.RecordRejection("POST", 413);
   EXPECT_TRUE(HasLine(registry.Expose(),
-                      R"(smithy_http_requests_total{method="POST",operation="",status="413"} 2)"))
+                      R"(http_requests_total{method="POST",operation="",status="413"} 2)"))
       << registry.Expose();
 }
 
@@ -278,11 +274,11 @@ TEST(MetricsRegistryTest, ARejectionBeforeTheMethodParsedIsNotAnInventedVerb) {
   registry.RecordRejection("", 431);
   registry.RecordRejection("BREW", 431);
   const std::string exposition = registry.Expose();
-  EXPECT_TRUE(HasLine(
-      exposition, R"(smithy_http_requests_total{method="unparsed",operation="",status="431"} 1)"))
+  EXPECT_TRUE(
+      HasLine(exposition, R"(http_requests_total{method="unparsed",operation="",status="431"} 1)"))
       << exposition;
-  EXPECT_TRUE(HasLine(exposition,
-                      R"(smithy_http_requests_total{method="other",operation="",status="431"} 1)"))
+  EXPECT_TRUE(
+      HasLine(exposition, R"(http_requests_total{method="other",operation="",status="431"} 1)"))
       << exposition;
 }
 
@@ -301,19 +297,16 @@ TEST(MetricsRegistryTest, ARejectionFilesNoLatencyAndMovesNoGauge) {
   const std::string exposition = registry.Expose();
   // One real observation, and the mean is still that observation.
   EXPECT_TRUE(HasLine(
-      exposition,
-      R"(smithy_http_request_duration_seconds_count{method="POST",operation="AddThing"} 1)"))
+      exposition, R"(http_request_duration_seconds_count{method="POST",operation="AddThing"} 1)"))
       << exposition;
   EXPECT_TRUE(HasLine(
-      exposition,
-      R"(smithy_http_request_duration_seconds_sum{method="POST",operation="AddThing"} 0.2)"))
+      exposition, R"(http_request_duration_seconds_sum{method="POST",operation="AddThing"} 0.2)"))
       << exposition;
   // No latency series was minted for the rejections at all.
-  EXPECT_EQ(
-      exposition.find(R"(smithy_http_request_duration_seconds_count{method="POST",operation=""})"),
-      std::string::npos)
+  EXPECT_EQ(exposition.find(R"(http_request_duration_seconds_count{method="POST",operation=""})"),
+            std::string::npos)
       << exposition;
-  EXPECT_TRUE(HasLine(exposition, "smithy_http_requests_in_flight 0")) << exposition;
+  EXPECT_TRUE(HasLine(exposition, "http_requests_in_flight 0")) << exposition;
 }
 
 TEST(MetricsRegistryTest, TheRejectionSinkFeedsTheRegistry) {
@@ -330,8 +323,8 @@ TEST(MetricsRegistryTest, TheRejectionSinkFeedsTheRegistry) {
   sink(Rejected{.status = 413, .method = "PUT", .target = "/upload/8f3a2b"});
 
   const std::string exposition = registry->Expose();
-  EXPECT_TRUE(HasLine(exposition,
-                      R"(smithy_http_requests_total{method="PUT",operation="",status="413"} 1)"))
+  EXPECT_TRUE(
+      HasLine(exposition, R"(http_requests_total{method="PUT",operation="",status="413"} 1)"))
       << exposition;
   // The target is dropped: a flood against distinct paths mints no series.
   EXPECT_EQ(exposition.find("8f3a2b"), std::string::npos) << exposition;
@@ -353,7 +346,7 @@ TEST(MetricsRegistryTest, ACustomCounterJoinsTheSameScrape) {
   EXPECT_TRUE(HasLine(exposition, "orders_processed_total 1")) << exposition;
   EXPECT_TRUE(HasLine(exposition, R"(orders_processed_total{region="us-east"} 4)")) << exposition;
   // The built-in families are still there, whole.
-  EXPECT_TRUE(HasLine(exposition, "# TYPE smithy_http_requests_total counter")) << exposition;
+  EXPECT_TRUE(HasLine(exposition, "# TYPE http_requests_total counter")) << exposition;
 }
 
 TEST(MetricsRegistryTest, AGaugeGoesUpAndDown) {
@@ -414,8 +407,8 @@ TEST(MetricsRegistryTest, AnUnboundedCustomLabelIsCappedAndAttributed) {
   }
   const std::string exposition = registry.Expose();
   EXPECT_EQ(exposition.find(R"(user_id="49")"), std::string::npos) << exposition;
-  EXPECT_TRUE(HasLine(
-      exposition, R"(smithy_metrics_observations_dropped_total{metric="user_events_total"} 46)"))
+  EXPECT_TRUE(
+      HasLine(exposition, R"(metrics_observations_dropped_total{metric="user_events_total"} 46)"))
       << exposition;
 }
 
@@ -486,8 +479,8 @@ TEST(MetricsRegistryTest, DeclaringRespectsTheSeriesCap) {
   }
   const std::string exposition = registry.Expose();
   EXPECT_EQ(exposition.find(R"(user_id="9")"), std::string::npos) << exposition;
-  EXPECT_TRUE(HasLine(exposition,
-                      R"(smithy_metrics_observations_dropped_total{metric="user_events_total"} 8)"))
+  EXPECT_TRUE(
+      HasLine(exposition, R"(metrics_observations_dropped_total{metric="user_events_total"} 8)"))
       << exposition;
 }
 
@@ -508,10 +501,7 @@ TEST(MetricsRegistryDeathTest, RegisteringAnInvalidOrCollidingNameAborts) {
       { MetricsRegistry(Enabled()).NewCounter("bad-name", "Dashes are not name characters."); },
       "");
   EXPECT_DEATH(
-      {
-        MetricsRegistry(Enabled()).NewCounter("smithy_http_requests_total", "Shadows a built-in.");
-      },
-      "");
+      { MetricsRegistry(Enabled()).NewCounter("http_requests_total", "Shadows a built-in."); }, "");
   EXPECT_DEATH(
       {
         MetricsRegistry registry(Enabled());
@@ -551,7 +541,7 @@ TEST(MetricsEndpointTest, ServesTheExpositionWithThePrometheusContentType) {
   const http::HttpResponse response = handler(Get("/metrics"));
   EXPECT_EQ(response.status, 200);
   EXPECT_EQ(response.headers.Get("content-type"), "text/plain; version=0.0.4; charset=utf-8");
-  EXPECT_TRUE(HasLine(response.body, "# TYPE smithy_http_requests_total counter")) << response.body;
+  EXPECT_TRUE(HasLine(response.body, "# TYPE http_requests_total counter")) << response.body;
 }
 
 TEST(MetricsEndpointTest, OtherPathsPassThroughToTheHandler) {
@@ -602,9 +592,8 @@ TEST(MetricsEndpointTest, TheCanonicalChainRecordsTrafficButNotScrapes) {
   handler(Get("/things"));
   const std::string exposition = handler(Get("/metrics")).body;
 
-  EXPECT_TRUE(
-      HasLine(exposition,
-              R"(smithy_http_requests_total{method="GET",operation="GetThing",status="200"} 2)"))
+  EXPECT_TRUE(HasLine(exposition,
+                      R"(http_requests_total{method="GET",operation="GetThing",status="200"} 2)"))
       << exposition;
   // Nothing recorded for the scrape itself: no empty-operation series.
   EXPECT_EQ(exposition.find(R"(operation="",status="200")"), std::string::npos) << exposition;
@@ -616,16 +605,15 @@ TEST(MetricsEndpointTest, RecordMetricsCarriesTheOperationAndStatusFromTheRespon
       Chain({MetricsEndpoint(registry), RecordMetrics(registry)}, Handler(503, "GetThing"));
 
   handler(Get("/things"));
-  EXPECT_TRUE(
-      HasLine(handler(Get("/metrics")).body,
-              R"(smithy_http_requests_total{method="GET",operation="GetThing",status="503"} 1)"));
+  EXPECT_TRUE(HasLine(handler(Get("/metrics")).body,
+                      R"(http_requests_total{method="GET",operation="GetThing",status="503"} 1)"));
 }
 
 TEST(MetricsEndpointTest, HealthProbesAreSeparableFromDispatchFailures) {
   // The reason HealthEndpoint labels its own path. Kubernetes polls a probe
   // every few seconds, so it is often the highest-volume "route" a service
   // has. Sharing the empty operation with 404s means the probe drowns the
-  // signal in `smithy_http_requests_total{operation=""}` and the 404 rate
+  // signal in `http_requests_total{operation=""}` and the 404 rate
   // cannot be read at all — and the probe's own latency, which is not the
   // service's, contaminates the same duration series.
   auto registry = std::make_shared<MetricsRegistry>(Enabled());
@@ -643,22 +631,22 @@ TEST(MetricsEndpointTest, HealthProbesAreSeparableFromDispatchFailures) {
   handler(Get("/nope"));
 
   const std::string exposition = handler(Get("/metrics")).body;
-  EXPECT_TRUE(HasLine(
-      exposition, R"(smithy_http_requests_total{method="GET",operation="/livez",status="200"} 1)"))
+  EXPECT_TRUE(
+      HasLine(exposition, R"(http_requests_total{method="GET",operation="/livez",status="200"} 1)"))
       << exposition;
-  EXPECT_TRUE(HasLine(
-      exposition, R"(smithy_http_requests_total{method="GET",operation="/readyz",status="503"} 1)"))
+  EXPECT_TRUE(HasLine(exposition,
+                      R"(http_requests_total{method="GET",operation="/readyz",status="503"} 1)"))
       << exposition;
   // The 404 keeps the empty operation, and now means only that.
-  EXPECT_TRUE(HasLine(exposition,
-                      R"(smithy_http_requests_total{method="GET",operation="",status="404"} 1)"))
+  EXPECT_TRUE(
+      HasLine(exposition, R"(http_requests_total{method="GET",operation="",status="404"} 1)"))
       << exposition;
   // Each probe has its own latency series, so `operation!~"/livez|/readyz"`
   // is expressible; before the label none of these three could be told apart.
-  EXPECT_TRUE(HasLine(exposition, R"(smithy_http_request_duration_seconds_count{method="GET",)"
+  EXPECT_TRUE(HasLine(exposition, R"(http_request_duration_seconds_count{method="GET",)"
                                   R"(operation="/livez"} 1)"))
       << exposition;
-  EXPECT_TRUE(HasLine(exposition, R"(smithy_http_request_duration_seconds_count{method="GET",)"
+  EXPECT_TRUE(HasLine(exposition, R"(http_request_duration_seconds_count{method="GET",)"
                                   R"(operation="/readyz"} 1)"))
       << exposition;
 }
@@ -672,9 +660,8 @@ TEST(MetricsEndpointTest, TheEndpointLabelsItselfWhenDeliberatelyRecorded) {
 
   handler(Get("/metrics"));
   const std::string exposition = handler(Get("/metrics")).body;
-  EXPECT_TRUE(
-      HasLine(exposition,
-              R"(smithy_http_requests_total{method="GET",operation="/metrics",status="200"} 1)"))
+  EXPECT_TRUE(HasLine(exposition,
+                      R"(http_requests_total{method="GET",operation="/metrics",status="200"} 1)"))
       << exposition;
 }
 
@@ -689,9 +676,9 @@ TEST(MetricsEndpointTest, AThrowingHandlerStillCompletesItsObservation) {
 
   EXPECT_THROW(handler(Get("/things")), std::runtime_error);
   const std::string exposition = handler(Get("/metrics")).body;
-  EXPECT_TRUE(HasLine(exposition, "smithy_http_requests_in_flight 0")) << exposition;
-  EXPECT_TRUE(HasLine(exposition,
-                      R"(smithy_http_requests_total{method="GET",operation="",status="500"} 1)"))
+  EXPECT_TRUE(HasLine(exposition, "http_requests_in_flight 0")) << exposition;
+  EXPECT_TRUE(
+      HasLine(exposition, R"(http_requests_total{method="GET",operation="",status="500"} 1)"))
       << exposition;
 }
 
@@ -779,8 +766,7 @@ TEST(DisabledRegistryDeathTest, RegistrationStillValidates) {
   // name only aborted when enabled, enabling it in production would be the
   // first time anyone found out.
   EXPECT_DEATH({ MetricsRegistry().NewCounter("bad-name", "Dashes are not names."); }, "");
-  EXPECT_DEATH(
-      { MetricsRegistry().NewCounter("smithy_http_requests_total", "Shadows a built-in."); }, "");
+  EXPECT_DEATH({ MetricsRegistry().NewCounter("http_requests_total", "Shadows a built-in."); }, "");
   EXPECT_DEATH(
       {
         MetricsRegistry registry;
@@ -835,9 +821,10 @@ TEST(AuraCompatibilityTest, ExportsTheFiveSharedFamiliesUnderTheirPinnedNames) {
       << exposition;
   EXPECT_TRUE(HasLine(exposition, "# TYPE http_server_request_duration_microseconds histogram"))
       << exposition;
-  // The smithy_ names are gone entirely, not emitted alongside: two families
-  // for one measurement double-count anything that sums across them.
-  EXPECT_EQ(exposition.find("smithy_http_"), std::string::npos) << exposition;
+  // The default dialect is replaced, not emitted alongside: two families for
+  // one measurement double-count anything that sums across them.
+  EXPECT_EQ(exposition.find("http_request_duration_seconds"), std::string::npos) << exposition;
+  EXPECT_EQ(exposition.find("http_requests_in_flight"), std::string::npos) << exposition;
 }
 
 TEST(AuraCompatibilityTest, LabelsEverySeriesTheWayTheDashboardsSelect) {
@@ -1037,9 +1024,9 @@ TEST(AuraCompatibilityDeathTest, ShadowingARenamedBuiltInStillAborts) {
   // And the old default names are no longer reserved in this dialect, since
   // nothing emits them any more.
   MetricsRegistry registry(options);
-  auto shadow = registry.NewCounter("smithy_http_requests_total", "Free in this dialect.");
+  auto shadow = registry.NewCounter("http_requests_total", "Free in this dialect.");
   shadow.Increment();
-  EXPECT_TRUE(HasLine(registry.Expose(), "smithy_http_requests_total 1")) << registry.Expose();
+  EXPECT_TRUE(HasLine(registry.Expose(), "http_requests_total 1")) << registry.Expose();
 }
 
 }  // namespace

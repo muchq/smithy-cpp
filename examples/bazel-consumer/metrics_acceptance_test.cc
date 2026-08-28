@@ -75,7 +75,9 @@ class MetricsHandler final : public TodoHandler {
 
 class MetricsAcceptanceTest : public ::testing::Test {
  protected:
-  void SetUp() override { Start(smithy::server::MetricsOptions{.enabled = true}); }
+  void SetUp() override {
+    Start(smithy::server::MetricsOptions{.enabled = true, .service_name = "todo-service"});
+  }
 
   // Stands the service up under `options`, so a subclass can exercise a
   // different dialect — or none at all — over the same real socket.
@@ -136,19 +138,26 @@ TEST_F(MetricsAcceptanceTest, TheGeneratedRoutersOperationIsTheMetricLabel) {
             "text/plain; version=0.0.4; charset=utf-8");
 
   const std::string& body = scrape->body;
-  // The operation names come from the model, through the generated router —
-  // not from anything this test stamped.
-  EXPECT_NE(body.find(R"(operation="AddTask")"), std::string::npos) << body;
-  EXPECT_NE(body.find(R"(operation="GetTask")"), std::string::npos) << body;
-  EXPECT_NE(body.find(R"(http_requests_total{method="POST",operation="AddTask",status="200"} 2)"),
+  // The route values come from the model, through the generated router — not
+  // from anything this test stamped.
+  EXPECT_NE(body.find(R"(route="AddTask")"), std::string::npos) << body;
+  EXPECT_NE(body.find(R"(route="GetTask")"), std::string::npos) << body;
+  EXPECT_NE(
+      body.find(
+          R"(http_server_requests_total{service_name="todo-service",http_method="POST",route="AddTask"} 2)"),
+      std::string::npos)
+      << body;
+  // The modeled error is served traffic too, and a failure by the 400
+  // boundary the dashboards split on.
+  EXPECT_NE(body.find(R"(http_server_requests_failure_total{service_name="todo-service",)"
+                      R"(http_method="GET",route="GetTask"} 1)"),
             std::string::npos)
       << body;
-  // The modeled error is served traffic too, under its own status.
-  EXPECT_NE(body.find(R"(operation="GetTask",status="404")"), std::string::npos) << body;
 
   // Latency was filed under the same operation label, with a real total.
   EXPECT_NE(
-      body.find(R"(http_request_duration_seconds_count{method="POST",operation="AddTask"} 2)"),
+      body.find(
+          R"(http_server_request_duration_microseconds_count{service_name="todo-service",http_method="POST",route="AddTask"} 2)"),
       std::string::npos)
       << body;
 }
@@ -163,9 +172,12 @@ TEST_F(MetricsAcceptanceTest, ScrapesDoNotCountThemselvesAndLeaveNothingInFlight
   const std::string& body = scrape->body;
   // MetricsEndpoint sits outside RecordMetrics, so three scrapes added no
   // GET series of their own.
-  EXPECT_EQ(body.find(R"(method="GET")"), std::string::npos) << body;
+  EXPECT_EQ(body.find(R"(http_method="GET")"), std::string::npos) << body;
   // Every request that started also finished.
-  EXPECT_NE(body.find("http_requests_in_flight 0"), std::string::npos) << body;
+  EXPECT_NE(body.find(R"(http_server_requests_active_gauge{service_name="todo-service",)"
+                      R"(http_method="POST"} 0)"),
+            std::string::npos)
+      << body;
 }
 
 TEST_F(MetricsAcceptanceTest, AnUnroutedRequestCountsWithAnEmptyOperation) {
@@ -182,8 +194,10 @@ TEST_F(MetricsAcceptanceTest, AnUnroutedRequestCountsWithAnEmptyOperation) {
   const auto scrape = Scrape();
   ASSERT_TRUE(scrape.ok()) << scrape.error().message();
   const std::string& body = scrape->body;
-  EXPECT_NE(body.find(R"(http_requests_total{method="GET",operation="",status="404"} 1)"),
-            std::string::npos)
+  EXPECT_NE(
+      body.find(
+          R"(http_server_requests_total{service_name="todo-service",http_method="GET",route="unmatched"} 1)"),
+      std::string::npos)
       << body;
   EXPECT_EQ(body.find("8f3a2b"), std::string::npos)
       << "the request target leaked into a label: " << body;
@@ -211,15 +225,21 @@ TEST_F(MetricsAcceptanceTest, AHealthProbeIsItsOwnSeriesNotAnAnonymous404) {
   const auto scrape = Scrape();
   ASSERT_TRUE(scrape.ok()) << scrape.error().message();
   const std::string& body = scrape->body;
-  EXPECT_NE(body.find(R"(http_requests_total{method="GET",operation="/livez",status="200"} 1)"),
-            std::string::npos)
+  EXPECT_NE(
+      body.find(
+          R"(http_server_requests_total{service_name="todo-service",http_method="GET",route="/livez"} 1)"),
+      std::string::npos)
       << body;
-  EXPECT_NE(body.find(R"(http_requests_total{method="GET",operation="",status="404"} 1)"),
-            std::string::npos)
+  EXPECT_NE(
+      body.find(
+          R"(http_server_requests_total{service_name="todo-service",http_method="GET",route="unmatched"} 1)"),
+      std::string::npos)
       << body;
   // And the probe's latency is its own, so a service p99 can exclude it.
-  EXPECT_NE(body.find(R"(http_request_duration_seconds_count{method="GET",operation="/livez"} 1)"),
-            std::string::npos)
+  EXPECT_NE(
+      body.find(
+          R"(http_server_request_duration_microseconds_count{service_name="todo-service",http_method="GET",route="/livez"} 1)"),
+      std::string::npos)
       << body;
 }
 
@@ -250,7 +270,7 @@ TEST_F(MetricsAcceptanceTest, ApplicationMetricsShareTheEndpointWithTheBuiltIns)
   EXPECT_NE(body.find("todo_tasks_stored 2"), std::string::npos) << body;
 
   // Still one scrape: the built-in families are unaffected by the additions.
-  EXPECT_NE(body.find(R"(operation="AddTask")"), std::string::npos) << body;
+  EXPECT_NE(body.find(R"(route="AddTask")"), std::string::npos) << body;
 }
 
 TEST_F(MetricsAcceptanceTest, DeclaredSeriesAreOnTheScrapeBeforeAnyTraffic) {
@@ -265,23 +285,7 @@ TEST_F(MetricsAcceptanceTest, DeclaredSeriesAreOnTheScrapeBeforeAnyTraffic) {
   EXPECT_NE(body.find("todo_tasks_stored 0"), std::string::npos) << body;
 }
 
-}  // namespace
-
-// The MoonBase dialect, driven out of tree over a real socket. In-tree the
-// route label comes from hand-written handlers; here it comes from the
-// generated router, which is the only level at which "prom_proxy would find
-// this service's operations" is a claim about the model rather than about a
-// test fixture.
-class AuraMetricsAcceptanceTest : public MetricsAcceptanceTest {
- protected:
-  void SetUp() override {
-    auto options = smithy::server::MetricsOptions::Aura("todo-service");
-    options.enabled = true;
-    Start(std::move(options));
-  }
-};
-
-TEST_F(AuraMetricsAcceptanceTest, TheGeneratedRoutersOperationIsTheRouteLabel) {
+TEST_F(MetricsAcceptanceTest, TheOutcomeCountersAndDurationCarryTheModelsRoute) {
   ASSERT_TRUE(client_->AddTask(AddTaskInput{.title = "ship it"}).ok());
   ASSERT_FALSE(client_->GetTask(GetTaskInput{.taskId = "nope"}).ok());
 
@@ -311,12 +315,11 @@ TEST_F(AuraMetricsAcceptanceTest, TheGeneratedRoutersOperationIsTheRouteLabel) {
   EXPECT_NE(body.find("http_server_requests_active_gauge{service_name=\"todo-service\""),
             std::string::npos)
       << body;
-  // The default dialect is replaced, not emitted alongside.
-  EXPECT_EQ(body.find("http_request_duration_seconds"), std::string::npos) << body;
-  EXPECT_EQ(body.find("http_requests_in_flight"), std::string::npos) << body;
+  // The registry's own health rides along, outside the contract.
+  EXPECT_NE(body.find("metrics_observations_dropped_total"), std::string::npos) << body;
 }
 
-TEST_F(AuraMetricsAcceptanceTest, TheProbeRouteThePanelsSubtractIsReported) {
+TEST_F(MetricsAcceptanceTest, TheProbeRouteThePanelsSubtractIsReported) {
   // This fixture composes HealthEndpoint("/livez"), so the probe reports
   // route="/livez". Under prom_proxy's fleet convention the endpoint would
   // be composed on its default "/health" and the Probes tile would find it;
@@ -353,7 +356,7 @@ TEST_F(AuraMetricsAcceptanceTest, TheProbeRouteThePanelsSubtractIsReported) {
 
 // Off is the default, so this is what a consumer gets by linking the metrics
 // stack without asking for it.
-class DisabledMetricsAcceptanceTest : public MetricsAcceptanceTest {
+class DisabledMetricsAcceptanceTest : public MetricsAcceptanceTest {  // NOLINT
  protected:
   void SetUp() override { Start(smithy::server::MetricsOptions{}); }
 };
@@ -367,7 +370,7 @@ TEST_F(DisabledMetricsAcceptanceTest, TheScrapePathIsNotServedAndTheServiceStill
   ASSERT_TRUE(scrape.ok()) << scrape.error().message();
   EXPECT_EQ(scrape->status, 404);
   EXPECT_EQ(scrape->body.find("http_server_"), std::string::npos) << scrape->body;
-  EXPECT_EQ(scrape->body.find("http_requests_total"), std::string::npos) << scrape->body;
+  EXPECT_EQ(scrape->body.find("http_server_requests_total"), std::string::npos) << scrape->body;
 
   // And the recorder composed away too, without disturbing the service or
   // the handler's own metric handles, which are inert rather than unusable.
@@ -375,3 +378,5 @@ TEST_F(DisabledMetricsAcceptanceTest, TheScrapePathIsNotServedAndTheServiceStill
   ASSERT_TRUE(added.ok()) << added.error().message();
   EXPECT_EQ(added->taskId, "task-1");
 }
+
+}  // namespace

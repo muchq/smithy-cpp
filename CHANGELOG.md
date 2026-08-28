@@ -11,9 +11,8 @@ policy in [docs/versioning.md](docs/versioning.md).
 - **A dependency-free Prometheus `/metrics` endpoint** (#91, first work
   item). `smithy::server::MetricsRegistry` aggregates the existing `Observe`
   hooks into three families —
-  `http_requests_total{method,operation,status}`,
-  `http_request_duration_seconds{method,operation}` (histogram), and
-  `http_requests_in_flight` — and `MetricsEndpoint` serves them in the
+  the five `http_server_*` families labeled by `service_name`, `http_method`
+  and `route` — and `MetricsEndpoint` serves them in the
   text exposition format, which needs no client library and so costs zero new
   dependencies. `RecordMetrics` is `Observe` wired to a registry, so request
   timing keeps one implementation and the scraped numbers cannot drift from
@@ -44,24 +43,23 @@ policy in [docs/versioning.md](docs/versioning.md).
   ladder aborts at startup either way, so enabling metrics in production is
   never the first time those checks run.
 
-  The built-in families are `http_requests_total`,
-  `http_request_duration_seconds` and `http_requests_in_flight`, under
-  Prometheus's own conventional names rather than a library prefix: what is
-  being measured is HTTP traffic, and Smithy is the IDL the service is
-  described in, not a property of the request being counted.
-
-  Names, labels, units and buckets are configurable, because an exposition
-  format is a contract with whatever is already scraping.
-  `MetricsOptions::Aura(service_name)` is a ready-made preset for
-  [MoonBase](https://github.com/muchq/MoonBase)'s shared HTTP vocabulary — the
-  five `http_server_*` families, the `service_name`/`http_method`/`route` label
-  set, the `unmatched` and `/health` route sentinels, the `CUSTOM` and
-  `(unparsed)` method sentinels, and the microsecond bucket ladder its three
-  emitter rails pin equal — so a smithy-cpp service can replace an
-  aura/futility, yodel, or server_pal one without touching a dashboard.
-  Success and failure counters are derived from the same status-keyed tally
-  the total sums, so the three cannot disagree. See the Observability section
-  of [docs/production-guide.md](docs/production-guide.md).
+  The exposition is [MoonBase](https://github.com/muchq/MoonBase)'s shared
+  HTTP serving contract, and is deliberately not configurable: the five
+  `http_server_*` families with the descriptions its three emitter rails pin,
+  the `service_name`/`http_method`/`route` label set, the `unmatched` and
+  `/health` route sentinels, the `CUSTOM` and `(unparsed)` method sentinels,
+  and the microsecond bucket ladder `//domains/platform/libs/otel_contract`
+  pins equal across them. Those services are who scrapes this, so a service
+  here can replace an aura/futility, yodel, or server_pal one without touching
+  a dashboard — and a knob would only be a way to drift off the contract
+  silently, since the failure renders as an empty panel rather than an error.
+  `service_name` is required when enabled and an empty one aborts, because
+  every dashboard query selects on it. Status is not a label: the success and
+  failure counters carry the outcome and are derived from the same tally the
+  total sums, so the three cannot disagree. The active gauge carries no route,
+  which is where every rail leaves it — it moves before dispatch. See the
+  Observability section of
+  [docs/production-guide.md](docs/production-guide.md).
 
 ### Fixed
 

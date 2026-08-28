@@ -406,66 +406,79 @@ order above is deliberate: the endpoint sits *outside* the recorder, so
 scrapes answer without being counted as served traffic — swap them and every
 scrape inflates your own request rate, at whatever interval Prometheus polls.
 
-Three families are exposed on `/metrics` (path configurable):
-`http_requests_total{method,operation,status}`,
-`http_request_duration_seconds{method,operation}` (a histogram, so
-`histogram_quantile` gives you tail latency), and
-`http_requests_in_flight`.
+Five families are exposed on `/metrics` (path configurable), labeled by
+`service_name`, `http_method` and `route`:
+
+| Family | Type | Notes |
+| --- | --- | --- |
+| `http_server_requests_total` | counter | every completed request |
+| `http_server_requests_success_total` | counter | status < 400 |
+| `http_server_requests_failure_total` | counter | status >= 400 |
+| `http_server_requests_active_gauge` | gauge | no `route` label; see below |
+| `http_server_request_duration_microseconds` | histogram | `_bucket`/`_sum`/`_count` |
+
+plus `metrics_observations_dropped_total`, the registry's own health.
+
+This is not a vocabulary of our own invention, and it is deliberately **not
+configurable**. It is [MoonBase](https://github.com/muchq/MoonBase)'s shared
+HTTP serving contract — spoken identically by its Java (yodel), Rust
+(server_pal) and C++ (futility/otel, behind aura) emitters, and pinned across
+them by `//domains/platform/libs/otel_contract`: names, descriptions, label
+sets, route sentinels and bucket boundaries alike. Those services are who
+scrapes this, and their dashboards (prom_proxy) query exactly these names with
+exactly these labels. A knob here would be a way for one service to drift off
+that contract, and the drift is silent — the panel renders empty, which looks
+like a quiet service rather than a misconfigured one. If a second fleet ever
+needs a different dialect, that is the point to design one.
+
+`service_name` is required whenever metrics are enabled, and an empty one
+aborts at construction: every dashboard query selects on it, so a service
+reporting the empty string is scraped, stored, and invisible.
+
+Three consequences of the contract worth knowing:
+
+- **Status is not a label.** The outcome rides on the success and failure
+  counters, which are two views of the same tally the total sums — so the
+  three can never disagree, and no series is multiplied by the codes a
+  service happens to return.
+- **The active gauge carries no route.** It moves at request start, before
+  dispatch, where nothing bounded is known about the path. Every rail leaves
+  the route off it for that reason, and prom_proxy's negative
+  `route!="/health"` matcher passes a series without the label through
+  untouched — which is what makes the same filter safe on it.
+- **Durations are microseconds**, on the ladder the rails pin equal.
+  `histogram_quantile` reads `le` off bucket counts, so a service on a
+  different ladder charts a quantile computed against different bins than
+  everything beside it.
 
 The label set is bounded by construction, because cardinality is what
 actually kills a metrics endpoint. `target` is deliberately *not* a label —
 it carries path parameters and query strings, so one series per distinct URL
-is one series per request id; `operation` is the bounded stand-in the router
-stamps from the model, empty for the 404/405/400 dispatch failures that never
-reached an operation. `HealthEndpoint` and `MetricsEndpoint` answer paths the
-model does not define, so they stamp that path as their operation
-(`operation="/livez"`): probes are usually a service's highest-volume route,
-and left unlabeled they would bury the 404 rate in the empty operation they
-share with it, and mix their own latency into the same duration histogram.
-The path is fixed at composition, so it is one series per composed endpoint —
-compose the probes inside `RecordMetrics` if you want them counted, outside
-it if you do not. `method` arrives from the wire, so anything outside the
-standard HTTP set collapses to `other` rather than minting a series per
-invented verb. Past `max_series` combinations the registry stops minting and
-counts what it refused in `metrics_observations_dropped_total` — alert on
-that being non-zero rather than discovering the cap as an OOM.
+is one series per request id; `route` is the bounded stand-in the router
+stamps from the model, and a request that reached no operation reports the
+`unmatched` sentinel rather than the empty string (`route!="/health"` matches
+the empty string, so unrouted traffic would silently join the serving
+figures). `HealthEndpoint` and `MetricsEndpoint` answer paths the model does
+not define, so they stamp that path as their route (`route="/health"`):
+probes are usually a service's highest-volume route, and left unlabeled they
+would bury the 404 rate in the sentinel they share with it, and mix their own
+latency into the same duration histogram. The path is fixed at composition,
+so it is one series per composed endpoint — compose the probes inside
+`RecordMetrics` if you want them counted, outside it if you do not.
+`http_method` arrives from the wire, so anything outside the nine RFC 9110
+verbs collapses to `CUSTOM` rather than minting a series per invented verb,
+and a request rejected before its method parsed reports `(unparsed)`. Past
+`max_series` combinations the registry stops minting and counts what it
+refused in `metrics_observations_dropped_total` — alert on that being
+non-zero rather than discovering the cap as an OOM.
 
-### Speaking another fleet's dialect
-
-An exposition format is a contract with whatever is already scraping, so the
-names, labels, units, and bucket ladder are all configurable on
-`MetricsOptions`. `MetricsOptions::Aura(service_name)` is a ready-made preset
-for [MoonBase](https://github.com/muchq/MoonBase)'s shared HTTP vocabulary,
-so a smithy-cpp service can replace an aura/futility, yodel, or server_pal one
-without touching a dashboard:
-
-```cpp
-auto options = smithy::server::MetricsOptions::Aura("todo-service");
-options.enabled = true;  // the preset does not turn it on for you
-auto metrics = std::make_shared<smithy::server::MetricsRegistry>(std::move(options));
-```
-
-It swaps in the five `http_server_*` families (`requests_total`,
-`requests_success_total`, `requests_failure_total`, `requests_active_gauge`,
-and `request_duration_microseconds`) with the descriptions that rail pins, the
-`service_name`/`http_method`/`route` label set, the `unmatched` and `/health`
-route vocabulary, the `CUSTOM` and `(unparsed)` method sentinels, and the
-microsecond bucket ladder the three MoonBase emitters share. Success and
-failure split at 400 and are derived from the same tally the total sums, so
-the three counters cannot disagree. The in-flight gauge carries no route on
-any rail — it moves at request start, before dispatch, where no bounded route
-exists — so it is labeled by method alone.
-
-Two things that composition still has to get right: compose `HealthEndpoint()`
-on its default `/health` path and *inside* `RecordMetrics`, because prom_proxy
-subtracts `route!="/health"` from every serving number and charts that route
-on its own tile — a service that never reports it reads as having no probe
-rather than as a healthy one. And point Prometheus at the service directly;
-the preset produces the collector's output shape without the collector.
-
-Every field is individually overridable for a fleet that speaks neither
-dialect. Names and label names are validated at construction, since one bad
-character yields a scrape Prometheus rejects in full.
+Two things composition still has to get right for the MoonBase dashboards:
+compose `HealthEndpoint()` on its default `/health` path and *inside*
+`RecordMetrics`, because prom_proxy subtracts `route!="/health"` from every
+serving number and charts that route on its own tile — a service that never
+reports it reads as having no probe rather than as a healthy one. And point
+Prometheus at the service directly: this produces the collector's output
+shape without the collector.
 
 Your own metrics share the same scrape — one Prometheus target covers the
 service, rather than the built-in families sitting behind one endpoint and

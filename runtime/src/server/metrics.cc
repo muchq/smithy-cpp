@@ -45,11 +45,45 @@ std::string EscapeLabel(std::string_view value) {
 // everything else shares one bucket. Case-sensitive, because HTTP methods
 // are (RFC 9110 §9.1) — "get" is not GET, and folding it in would report
 // traffic the server actually rejected as if it had been served.
-std::string NormalizeMethod(std::string_view method, const std::string& nonstandard) {
+// The contract, transcribed. Every literal below is pinned on the MoonBase
+// side by //domains/platform/libs/otel_contract; treat this block as data
+// copied from there rather than as names chosen here.
+constexpr std::string_view kRequestsTotal = "http_server_requests_total";
+constexpr std::string_view kRequestsSuccess = "http_server_requests_success_total";
+constexpr std::string_view kRequestsFailure = "http_server_requests_failure_total";
+constexpr std::string_view kRequestsActive = "http_server_requests_active_gauge";
+constexpr std::string_view kRequestDuration = "http_server_request_duration_microseconds";
+constexpr std::string_view kObservationsDropped = "metrics_observations_dropped_total";
+
+constexpr std::string_view kRequestsTotalHelp = "HTTP requests received";
+constexpr std::string_view kRequestsSuccessHelp = "HTTP requests completed successfully (2xx-3xx)";
+constexpr std::string_view kRequestsFailureHelp = "HTTP requests that returned 4xx or 5xx";
+constexpr std::string_view kRequestsActiveHelp = "HTTP requests currently in flight";
+constexpr std::string_view kRequestDurationHelp = "HTTP request duration in microseconds";
+constexpr std::string_view kObservationsDroppedHelp =
+    "Observations dropped after the registry hit its series cap.";
+
+constexpr std::string_view kServiceLabel = "service_name";
+constexpr std::string_view kMethodLabel = "http_method";
+constexpr std::string_view kRouteLabel = "route";
+
+// A request that reached no operation. Never the empty string: prom_proxy
+// subtracts `route!="/health"` from every serving number, and that matcher
+// matches the empty string too — unrouted traffic would silently join the
+// serving figures instead of being visible as its own thing.
+constexpr std::string_view kUnmatchedRoute = "unmatched";
+// A method outside the nine RFC 9110 verbs, and one the transport rejected
+// before a method token existed at all (a 431 can fire mid-headers). Kept
+// distinct because "never parsed" and "client invented a verb" are different
+// diagnoses.
+constexpr std::string_view kCustomMethod = "CUSTOM";
+constexpr std::string_view kUnparsedMethod = "(unparsed)";
+
+std::string NormalizeMethod(std::string_view method) {
   static constexpr std::array<std::string_view, 9> kKnown = {
       "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE", "CONNECT"};
   const auto* found = std::ranges::find(kKnown, method);
-  return found == kKnown.end() ? nonstandard : std::string(*found);
+  return std::string(found == kKnown.end() ? kCustomMethod : *found);
 }
 
 // Prometheus numbers: plain decimal, no trailing zero noise. Six decimals is
@@ -200,123 +234,34 @@ void MetricFamily::Declare(const MetricLabels& labels) {
 
 }  // namespace internal
 
-MetricsOptions MetricsOptions::Aura(std::string service_name) {
-  // The exposition MoonBase's three emitter rails share and its prom_proxy
-  // dashboards query. Every literal here is pinned on the MoonBase side —
-  // the names and descriptions by //domains/platform/libs/otel_contract, the
-  // route vocabulary by its label test, the buckets by its bucket test — so
-  // treat this whole function as a transcription, not a design.
-  MetricsOptions options;
-  options.requests_total_name = "http_server_requests_total";
-  options.requests_success_name = "http_server_requests_success_total";
-  options.requests_failure_name = "http_server_requests_failure_total";
-  options.request_duration_name = "http_server_request_duration_microseconds";
-  options.requests_in_flight_name = "http_server_requests_active_gauge";
-
-  options.requests_total_help = "HTTP requests received";
-  options.requests_success_help = "HTTP requests completed successfully (2xx-3xx)";
-  options.requests_failure_help = "HTTP requests that returned 4xx or 5xx";
-  options.request_duration_help = "HTTP request duration in microseconds";
-  options.requests_in_flight_help = "HTTP requests currently in flight";
-
-  options.method_label = "http_method";
-  options.route_label = "route";
-  // The outcome rides on the success and failure counters instead. Keeping
-  // status as well would multiply every series by the codes seen for no
-  // gain: the dashboards aggregate with sum() and never select on it.
-  options.status_label = "";
-  options.constant_labels = {{"service_name", std::move(service_name)}};
-  options.in_flight_by_method = true;
-
-  options.unrouted_route = "unmatched";
-  options.nonstandard_method = "CUSTOM";
-  options.unparsed_method = "(unparsed)";
-
-  options.latency_unit = LatencyUnit::kMicroseconds;
-  options.latency_buckets = AuraLatencyBuckets();
-  return options;
-}
-
 MetricsRegistry::MetricsRegistry(MetricsOptions options) : options_(std::move(options)) {
-  // Composition-time validation (ADR-0009), and deliberately not conditional
-  // on `enabled`: a name or ladder that would corrupt the scrape must abort
-  // on the first run either way, so that turning metrics on in production is
-  // never the first time these run.
-  //
-  // An unsorted or non-finite ladder does not fail loudly at scrape time. It
-  // silently produces cumulative buckets that disagree with themselves,
-  // which a dashboard renders as plausible nonsense.
-  const std::vector<double>& buckets = options_.latency_buckets;
-  for (std::size_t i = 0; i < buckets.size(); ++i) {
-    if (!std::isfinite(buckets[i])) {
-      smithy::internal::Fatal(
-          "smithy::server::MetricsRegistry: latency buckets must all be finite (the +Inf bucket is "
-          "implicit)");
-    }
-    if (i > 0 && buckets[i] <= buckets[i - 1]) {
-      smithy::internal::Fatal(
-          "smithy::server::MetricsRegistry: latency buckets must be strictly ascending");
-    }
-  }
-  // Every configured name reaches the exposition verbatim, so an invalid one
-  // yields a scrape Prometheus rejects in full — with no in-process consumer
-  // to notice. The success and failure names are optional; the rest are not.
-  for (const std::string* name :
-       {&options_.requests_total_name, &options_.request_duration_name,
-        &options_.requests_in_flight_name, &options_.observations_dropped_name}) {
-    if (!ValidName(*name, /*allow_colon=*/true)) {
-      smithy::internal::Fatal("smithy::server::MetricsRegistry: invalid metric name '" + *name +
-                              "'");
-    }
-  }
-  for (const std::string* name :
-       {&options_.requests_success_name, &options_.requests_failure_name}) {
-    if (!name->empty() && !ValidName(*name, /*allow_colon=*/true)) {
-      smithy::internal::Fatal("smithy::server::MetricsRegistry: invalid metric name '" + *name +
-                              "'");
-    }
-  }
-  for (const std::string* label : {&options_.method_label, &options_.route_label}) {
-    if (!ValidName(*label, /*allow_colon=*/false)) {
-      smithy::internal::Fatal("smithy::server::MetricsRegistry: invalid label name '" + *label +
-                              "'");
-    }
-  }
-  if (!options_.status_label.empty() && !ValidName(options_.status_label, /*allow_colon=*/false)) {
-    smithy::internal::Fatal("smithy::server::MetricsRegistry: invalid label name '" +
-                            options_.status_label + "'");
-  }
-  for (const auto& [name, value] : options_.constant_labels) {
-    (void)value;
-    if (!ValidName(name, /*allow_colon=*/false)) {
-      smithy::internal::Fatal("smithy::server::MetricsRegistry: invalid label name '" + name + "'");
-    }
+  // Composition-time validation (ADR-0009). An empty service_name is scraped
+  // and stored exactly like a good one — every dashboard query selects on the
+  // label, so the service is simply absent from all of them. That is the
+  // failure mode worth aborting for: it looks like success everywhere except
+  // the panel nobody is watching yet.
+  if (options_.enabled && options_.service_name.empty()) {
+    smithy::internal::Fatal(
+        "smithy::server::MetricsRegistry: service_name is required when metrics are enabled");
   }
 }
 
 std::string MetricsRegistry::BuiltInLabels(const MetricLabels& labels) const {
-  // Not RenderLabels: these are emitted in a fixed order (constants, then
-  // method, route, status) rather than sorted, so the built-in families read
-  // the way the header documents them. Prometheus does not care about label
-  // order; a human reading a scrape does.
+  // Not RenderLabels: these are emitted in a fixed order (service_name, then
+  // method, route) rather than sorted, so the built-in families read the way
+  // the header documents them. Prometheus does not care about label order; a
+  // human reading a scrape does.
   std::string out;
-  const auto append = [&out](const std::string& name, const std::string& value) {
-    if (name.empty()) {
-      return;
-    }
-    if (!out.empty()) {
-      out += ',';
-    }
+  out += kServiceLabel;
+  out += "=\"";
+  out += EscapeLabel(options_.service_name);
+  out += '"';
+  for (const auto& [name, value] : labels) {
+    out += ',';
     out += name;
     out += "=\"";
     out += EscapeLabel(value);
     out += '"';
-  };
-  for (const auto& [name, value] : options_.constant_labels) {
-    append(name, value);
-  }
-  for (const auto& [name, value] : labels) {
-    append(name, value);
   }
   return out;
 }
@@ -329,7 +274,7 @@ void MetricsRegistry::RecordStart(const RequestStart& start) {
   // only bounded thing known about the request is its method. The gauge is
   // always keyed by method — the unlabeled form is the sum over these keys —
   // and the key set is bounded by the method vocabulary.
-  std::string method = NormalizeMethod(start.method, options_.nonstandard_method);
+  std::string method = NormalizeMethod(start.method);
   const std::lock_guard<std::mutex> lock(mutex_);
   ++in_flight_[std::move(method)];
 }
@@ -338,19 +283,12 @@ void MetricsRegistry::Record(const RequestObservation& observation) {
   if (!options_.enabled) {
     return;
   }
-  // Seconds is the Prometheus base unit and the default; a fleet whose
-  // dashboards are already written against microseconds cannot read seconds
-  // without rewriting every query. This is the only place the microsecond
-  // hook meets the float histogram either way.
-  const double duration = options_.latency_unit == LatencyUnit::kMicroseconds
-                              ? static_cast<double>(observation.duration.count())
-                              : std::chrono::duration<double>(observation.duration).count();
-  // A request that reached no operation reports the configured constant
-  // rather than nothing, so a fleet whose dashboards select on a sentinel
-  // ("unmatched") can say so instead of matching the empty string.
+  // The hook is already microseconds, which is the exposition's unit too, so
+  // nothing is converted and nothing is rounded away.
+  const auto duration = static_cast<double>(observation.duration.count());
   const CountKey count_key{
-      .method = NormalizeMethod(observation.method, options_.nonstandard_method),
-      .route = observation.operation.empty() ? options_.unrouted_route : observation.operation,
+      .method = NormalizeMethod(observation.method),
+      .route = observation.operation.empty() ? std::string(kUnmatchedRoute) : observation.operation,
       .status = observation.status};
   const LatencyKey latency_key{.method = count_key.method, .route = count_key.route};
 
@@ -381,7 +319,7 @@ void MetricsRegistry::Record(const RequestObservation& observation) {
     if (latency == latencies_.end()) {
       latency = latencies_
                     .emplace(latency_key, HistogramData{.counts = std::vector<std::uint64_t>(
-                                                            options_.latency_buckets.size(), 0)})
+                                                            HttpLatencyBuckets().size(), 0)})
                     .first;
     }
     HistogramData& histogram = latency->second;
@@ -390,9 +328,9 @@ void MetricsRegistry::Record(const RequestObservation& observation) {
     // The first bucket at or above the value; a value past the last one
     // lands only in +Inf, which the exposition takes from `count`. Buckets
     // are upper-inclusive, which is what `le` means.
-    const auto bucket = std::ranges::lower_bound(options_.latency_buckets, duration);
-    if (bucket != options_.latency_buckets.end()) {
-      ++histogram.counts[static_cast<std::size_t>(bucket - options_.latency_buckets.begin())];
+    const auto bucket = std::ranges::lower_bound(HttpLatencyBuckets(), duration);
+    if (bucket != HttpLatencyBuckets().end()) {
+      ++histogram.counts[static_cast<std::size_t>(bucket - HttpLatencyBuckets().begin())];
     }
   }
   if (dropped) {
@@ -408,11 +346,10 @@ void MetricsRegistry::RecordRejection(std::string_view method, int status) {
   // before the method token was ever read, and that is a different diagnosis
   // from a client inventing a verb. Both are constants, which is what the
   // label set needs.
-  const CountKey key{.method = method.empty()
-                                   ? options_.unparsed_method
-                                   : NormalizeMethod(method, options_.nonstandard_method),
-                     .route = options_.unrouted_route,
-                     .status = status};
+  const CountKey key{
+      .method = method.empty() ? std::string(kUnparsedMethod) : NormalizeMethod(method),
+      .route = std::string(kUnmatchedRoute),
+      .status = status};
   const std::lock_guard<std::mutex> lock(mutex_);
   if (auto found = counts_.find(key); found != counts_.end()) {
     ++found->second;
@@ -434,11 +371,10 @@ std::shared_ptr<internal::MetricFamily> MetricsRegistry::Register(std::string na
   // names would appear twice with two TYPE lines — a scrape Prometheus
   // rejects whole. Checked against the configured names, since those are
   // what actually reach the exposition.
-  for (const std::string& reserved :
-       {options_.requests_total_name, options_.requests_success_name,
-        options_.requests_failure_name, options_.request_duration_name,
-        options_.requests_in_flight_name, options_.observations_dropped_name}) {
-    if (!reserved.empty() && name == reserved) {
+  for (const std::string_view reserved :
+       {kRequestsTotal, kRequestsSuccess, kRequestsFailure, kRequestsActive, kRequestDuration,
+        kObservationsDropped}) {
+    if (name == reserved) {
       smithy::internal::Fatal("smithy::server::MetricsRegistry: '" + name +
                               "' is one of the built-in families");
     }
@@ -500,7 +436,7 @@ std::string MetricsRegistry::Expose() const {
   // a family contiguous, which the format requires. Headers print even with
   // no samples yet, so a freshly started server still describes its shape.
   //
-  // The request counters are three views of one tally rather than three
+  // The three request counters are views of one tally rather than three
   // tallies: success and failure are derived from the same status-keyed
   // counts the total sums, so they cannot disagree with it or with each
   // other, and they need no drop accounting of their own.
@@ -522,86 +458,50 @@ std::string MetricsRegistry::Expose() const {
     }
   }
   const auto route_labels = [this](const LatencyKey& key) {
-    return BuiltInLabels({{options_.method_label, key.method}, {options_.route_label, key.route}});
+    return BuiltInLabels(
+        {{std::string(kMethodLabel), key.method}, {std::string(kRouteLabel), key.route}});
   };
-
-  AppendFamilyHeader(out, options_.requests_total_name, "counter", options_.requests_total_help);
-  if (options_.status_label.empty()) {
+  const auto counter_family = [&](std::string_view name, std::string_view help,
+                                  std::uint64_t Outcome::*field) {
+    AppendFamilyHeader(out, name, "counter", help);
     for (const auto& [key, outcome] : by_route) {
-      AppendSample(out, options_.requests_total_name, "", route_labels(key),
-                   std::to_string(outcome.total));
+      AppendSample(out, name, "", route_labels(key), std::to_string(outcome.*field));
     }
-  } else {
-    for (const auto& [key, value] : counts_) {
-      AppendSample(out, options_.requests_total_name, "",
-                   BuiltInLabels({{options_.method_label, key.method},
-                                  {options_.route_label, key.route},
-                                  {options_.status_label, std::to_string(key.status)}}),
-                   std::to_string(value));
-    }
-  }
+  };
+  counter_family(kRequestsTotal, kRequestsTotalHelp, &Outcome::total);
+  counter_family(kRequestsSuccess, kRequestsSuccessHelp, &Outcome::success);
+  counter_family(kRequestsFailure, kRequestsFailureHelp, &Outcome::failure);
 
-  if (!options_.requests_success_name.empty()) {
-    AppendFamilyHeader(out, options_.requests_success_name, "counter",
-                       options_.requests_success_help);
-    for (const auto& [key, outcome] : by_route) {
-      AppendSample(out, options_.requests_success_name, "", route_labels(key),
-                   std::to_string(outcome.success));
-    }
-  }
-  if (!options_.requests_failure_name.empty()) {
-    AppendFamilyHeader(out, options_.requests_failure_name, "counter",
-                       options_.requests_failure_help);
-    for (const auto& [key, outcome] : by_route) {
-      AppendSample(out, options_.requests_failure_name, "", route_labels(key),
-                   std::to_string(outcome.failure));
-    }
-  }
-
-  AppendFamilyHeader(out, options_.request_duration_name, "histogram",
-                     options_.request_duration_help);
+  AppendFamilyHeader(out, kRequestDuration, "histogram", kRequestDurationHelp);
   for (const auto& [key, histogram] : latencies_) {
     const std::string labels = route_labels(key);
-    const std::string prefix = labels.empty() ? std::string() : labels + ",";
+    const std::string prefix = labels + ",";
     std::uint64_t cumulative = 0;
-    for (std::size_t i = 0; i < options_.latency_buckets.size(); ++i) {
+    for (std::size_t i = 0; i < HttpLatencyBuckets().size(); ++i) {
       cumulative += histogram.counts[i];
-      AppendSample(out, options_.request_duration_name, "_bucket",
-                   prefix + "le=\"" + FormatNumber(options_.latency_buckets[i]) + "\"",
+      AppendSample(out, kRequestDuration, "_bucket",
+                   prefix + "le=\"" + FormatNumber(HttpLatencyBuckets()[i]) + "\"",
                    std::to_string(cumulative));
     }
     // +Inf is the total by definition, which also covers values past the
     // last finite bucket.
-    AppendSample(out, options_.request_duration_name, "_bucket", prefix + "le=\"+Inf\"",
+    AppendSample(out, kRequestDuration, "_bucket", prefix + "le=\"+Inf\"",
                  std::to_string(histogram.count));
-    AppendSample(out, options_.request_duration_name, "_sum", labels, FormatNumber(histogram.sum));
-    AppendSample(out, options_.request_duration_name, "_count", labels,
-                 std::to_string(histogram.count));
+    AppendSample(out, kRequestDuration, "_sum", labels, FormatNumber(histogram.sum));
+    AppendSample(out, kRequestDuration, "_count", labels, std::to_string(histogram.count));
   }
 
-  AppendFamilyHeader(out, options_.requests_in_flight_name, "gauge",
-                     options_.requests_in_flight_help);
-  if (options_.in_flight_by_method) {
-    // No zero baseline here: the method labels are not known until traffic
-    // arrives, so there is no series to declare. The unlabeled form below
-    // can be baselined and is.
-    for (const auto& [method, count] : in_flight_) {
-      AppendSample(out, options_.requests_in_flight_name, "",
-                   BuiltInLabels({{options_.method_label, method}}), std::to_string(count));
-    }
-  } else {
-    std::int64_t total = 0;
-    for (const auto& [method, count] : in_flight_) {
-      (void)method;
-      total += count;
-    }
-    AppendSample(out, options_.requests_in_flight_name, "", BuiltInLabels({}),
-                 std::to_string(total));
+  // No route label, and no zero baseline: the gauge moves at request start,
+  // where the method is the only bounded thing known, and the methods a
+  // service will see are not knowable before it sees them.
+  AppendFamilyHeader(out, kRequestsActive, "gauge", kRequestsActiveHelp);
+  for (const auto& [method, count] : in_flight_) {
+    AppendSample(out, kRequestsActive, "", BuiltInLabels({{std::string(kMethodLabel), method}}),
+                 std::to_string(count));
   }
 
-  AppendFamilyHeader(out, options_.observations_dropped_name, "counter",
-                     options_.observations_dropped_help);
-  AppendSample(out, options_.observations_dropped_name, "", BuiltInLabels({}),
+  AppendFamilyHeader(out, kObservationsDropped, "counter", kObservationsDroppedHelp);
+  AppendSample(out, kObservationsDropped, "", BuiltInLabels({}),
                std::to_string(observations_dropped_));
   // Application families last, each whole and in name order; their samples
   // are already keyed by rendered labels, so a family's series are
@@ -637,7 +537,7 @@ std::string MetricsRegistry::Expose() const {
       AppendSample(out, name, "_count", labels, std::to_string(sample.count));
     }
     if (family->dropped != 0) {
-      AppendSample(out, options_.observations_dropped_name, "", BuiltInLabels({{"metric", name}}),
+      AppendSample(out, kObservationsDropped, "", BuiltInLabels({{"metric", name}}),
                    std::to_string(family->dropped));
     }
   }

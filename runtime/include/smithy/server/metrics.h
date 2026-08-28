@@ -26,9 +26,12 @@ namespace smithy::server {
 // the same Observe hook everything else uses, and MetricsEndpoint serves what
 // the registry holds.
 //
-//   auto metrics = std::make_shared<smithy::server::MetricsRegistry>();
+//   auto metrics = std::make_shared<smithy::server::MetricsRegistry>(
+//       smithy::server::MetricsOptions{.enabled = true,
+//                                      .service_name = "todo-service"});
 //   transport.Start(smithy::server::Chain({MetricsEndpoint(metrics),
-//                                          RecordMetrics(metrics)},
+//                                          RecordMetrics(metrics),
+//                                          HealthEndpoint()},
 //                                         server.Handler()));
 //
 // Order matters, and this one is deliberate: the endpoint sits OUTSIDE the
@@ -36,28 +39,59 @@ namespace smithy::server {
 // RecordMetrics first instead and every scrape inflates your own request
 // rate — at whatever interval Prometheus polls.
 //
-// The built-in families, under Prometheus's own conventional names — the
-// library is not what is being measured, so it does not appear in them:
+// The five built-in families, labeled by service_name, http_method and route:
 //
-//   http_requests_total{method,operation,status}    counter
-//   http_request_duration_seconds{method,operation} histogram (+ _sum/_count)
-//   http_requests_in_flight                         gauge
+//   http_server_requests_total                counter
+//   http_server_requests_success_total        counter  (status < 400)
+//   http_server_requests_failure_total        counter  (status >= 400)
+//   http_server_requests_active_gauge         gauge    (no route; see below)
+//   http_server_request_duration_microseconds histogram (+ _sum/_count)
 //
-// All of them are configurable; see MetricsOptions.
+// plus `metrics_observations_dropped_total`, the registry's own health.
 //
-// Status is the exact code rather than a class: it is bounded either way,
-// and `{status=~"5.."}` recovers the class at query time while the reverse
-// direction loses information that matters at 3am.
+// This is not a vocabulary of our own invention. It is MoonBase's shared HTTP
+// serving contract, spoken identically by its Java (yodel), Rust
+// (server_pal), and C++ (futility/otel, behind aura) emitters and pinned
+// across them by //domains/platform/libs/otel_contract — names, descriptions,
+// label sets, route sentinels, and bucket boundaries alike. Those services
+// are who scrapes this, and their dashboards (prom_proxy) query these names
+// with these labels. A service here that invented its own spelling would
+// simply not appear on them.
+//
+// So the exposition is deliberately NOT configurable. A knob here is a way
+// for one service to drift off the contract, and the failure is silent: the
+// dashboard renders an empty panel, which looks like a quiet service rather
+// than a misconfigured one. If a second fleet ever needs a different dialect,
+// that is the point to design one — not before.
+//
+// Consequences of the contract worth knowing before reading the code:
+//
+//   - The status code is not a label. The outcome rides on the success and
+//     failure counters, which are two views of the same tally the total sums
+//     — so the three can never disagree, and no series is multiplied by the
+//     codes a service happens to return.
+//   - The active gauge carries no route. It moves at request start, before
+//     dispatch, where nothing bounded is known about the path; every rail
+//     leaves the route off it for that reason, and prom_proxy's negative
+//     `route!="/health"` matcher passes a series without the label through
+//     untouched, which is what makes the same filter safe on it.
+//   - Durations are microseconds, on the ladder the rails pin equal.
+//     `histogram_quantile` reads `le` off bucket counts, so a service on a
+//     different ladder charts a quantile computed against different bins
+//     than everything beside it.
 //
 // Application metrics join the same scrape through NewCounter / NewGauge /
 // NewHistogram; see MetricsRegistry below.
 
-// The bucket boundaries of `http_request_duration_seconds`, in
-// seconds — Prometheus's own default ladder, which is tuned for exactly this
-// shape of measurement (sub-millisecond to ten seconds).
-inline const std::vector<double>& DefaultLatencyBuckets() {
-  static const std::vector<double> kBuckets = {0.005, 0.01, 0.025, 0.05, 0.1, 0.25,
-                                               0.5,   1.0,  2.5,   5.0,  10.0};
+// The HTTP latency bucket boundaries, in microseconds (MoonBase #1286,
+// pinned equal across its three emitter rails by
+// //domains/platform/libs/otel_contract). Exported because an application
+// histogram that measures a request-shaped duration should land on the same
+// ladder; one measuring anything else should pass its own.
+inline const std::vector<double>& HttpLatencyBuckets() {
+  static const std::vector<double> kBuckets = {100,    250,    500,     1000,    2500,
+                                               5000,   10000,  25000,   50000,   100000,
+                                               250000, 500000, 1000000, 2500000, 10000000};
   return kBuckets;
 }
 
@@ -192,27 +226,9 @@ class Histogram {
   std::shared_ptr<internal::MetricFamily> family_;
 };
 
-// Which unit the built-in latency histogram records in. Seconds is
-// Prometheus's own base unit and the default; microseconds exists because a
-// fleet that already has microsecond dashboards cannot read seconds without
-// rewriting every query it has.
-enum class LatencyUnit { kSeconds, kMicroseconds };
-
-// The microsecond bucket ladder MoonBase's three emitter rails share
-// (MoonBase #1286, pinned equal across them by
-// //domains/platform/libs/otel_contract). Bucket layouts only compare like
-// with like: `histogram_quantile` reads `le` off bucket counts, so a service
-// joining an existing dashboard has to land on the same boundaries or its
-// quantiles are computed against a different ladder than everything beside
-// it. Use it with LatencyUnit::kMicroseconds.
-inline const std::vector<double>& AuraLatencyBuckets() {
-  static const std::vector<double> kBuckets = {100,    250,    500,     1000,    2500,
-                                               5000,   10000,  25000,   50000,   100000,
-                                               250000, 500000, 1000000, 2500000, 10000000};
-  return kBuckets;
-}
-
-// How a registry behaves and what its built-in families are called.
+// How a registry behaves. Everything about *what* it exposes is fixed by the
+// contract described at the top of this header; what is left is whether it
+// runs at all, who it says it is, and the cardinality backstop.
 //
 // `enabled` is false, so a registry costs nothing until something turns it
 // on. Disabled, RecordMetrics and MetricsEndpoint compose to the identity —
@@ -221,90 +237,20 @@ inline const std::vector<double>& AuraLatencyBuckets() {
 // written. Registration still validates: a bad metric name or a type
 // collision aborts whether or not the registry is enabled, so switching it
 // on in production is never the first time those checks run.
-//
-// The names and labels are configurable because an exposition format is a
-// contract with whatever is already scraping. The defaults are this
-// library's own; MetricsOptions::Aura() is the vocabulary MoonBase's
-// dashboards read. Everything is individually overridable for a fleet that
-// speaks neither.
 struct MetricsOptions {
   // Nothing is recorded, exposed, or composed until this is true.
   bool enabled = false;
+
+  // The `service_name` label on every built-in series. Required when
+  // enabled, and an empty one aborts (ADR-0009): every dashboard query
+  // selects on it, so a service reporting the empty string is scraped,
+  // stored, and invisible — the failure mode that looks like success.
+  std::string service_name{};
 
   // Bounds the distinct {method,route,status} and {method,route}
   // combinations retained, and separately the series of each application
   // family; see the cardinality note on MetricsRegistry.
   std::size_t max_series = 4096;
-
-  // Family names. An empty success/failure name means that family is not
-  // emitted at all — the default, since the status label already carries the
-  // outcome and `{status=~"5.."}` recovers it at query time.
-  std::string requests_total_name = "http_requests_total";
-  std::string requests_success_name{};
-  std::string requests_failure_name{};
-  std::string request_duration_name = "http_request_duration_seconds";
-  std::string requests_in_flight_name = "http_requests_in_flight";
-  // The registry's own health: observations refused after a family hit the
-  // series cap. Alert on it being non-zero rather than discovering the cap
-  // as an OOM.
-  std::string observations_dropped_name = "metrics_observations_dropped_total";
-
-  // HELP text. Part of the contract when these names are shared with another
-  // emitter: a collector merging series by name keeps the first description
-  // it sees and logs a conflict for every later one that disagrees.
-  std::string requests_total_help =
-      "Total HTTP requests served, by method, Smithy operation, and status code.";
-  std::string requests_success_help = "HTTP requests completed successfully (2xx-3xx)";
-  std::string requests_failure_help = "HTTP requests that returned 4xx or 5xx";
-  std::string request_duration_help = "Request latency in seconds, by method and Smithy operation.";
-  std::string requests_in_flight_help = "Requests currently being served.";
-  std::string observations_dropped_help =
-      "Observations dropped after the registry hit its series cap.";
-
-  // Label names. An empty status_label drops that label, which aggregates
-  // the counter over status codes — the shape to use when success and
-  // failure counters carry the outcome instead.
-  std::string method_label = "method";
-  std::string route_label = "operation";
-  std::string status_label = "status";
-
-  // Labels added to every built-in series, for a scrape that has to identify
-  // the service in the metric itself rather than in the scrape target — a
-  // dashboard selecting `{service_name="..."}` across a fleet, say.
-  MetricLabels constant_labels{};
-
-  // The in-flight gauge carries no route on purpose: it moves at request
-  // start, before dispatch, where nothing bounded is known about the path.
-  // It can still be labeled by method, which is known that early.
-  bool in_flight_by_method = false;
-
-  // The vocabulary for values the request itself did not supply. A request
-  // that reached no operation reports `unrouted_route`; a method outside the
-  // nine RFC 9110 verbs reports `nonstandard_method`; a request rejected
-  // before its method was parsed reports `unparsed_method`. All three are
-  // constants, which is what keeps the label set bounded.
-  std::string unrouted_route{};
-  std::string nonstandard_method = "other";
-  std::string unparsed_method = "unparsed";
-
-  LatencyUnit latency_unit = LatencyUnit::kSeconds;
-  std::vector<double> latency_buckets = DefaultLatencyBuckets();
-
-  // The exposition MoonBase's prom_proxy dashboards already query, so a
-  // smithy-cpp service can replace an aura/futility, yodel, or server_pal
-  // one without touching a dashboard: the five http_server_* families, the
-  // service_name/http_method/route label set, the route vocabulary
-  // ("unmatched" for unrouted, "/health" for the probe — which
-  // HealthEndpoint's default path already produces), the CUSTOM and
-  // (unparsed) method sentinels, and the shared microsecond bucket ladder.
-  //
-  // Still off unless you also set `enabled`.
-  //
-  // Compose HealthEndpoint() inside RecordMetrics for the probe route to
-  // exist at all: prom_proxy subtracts `route!="/health"` from every serving
-  // number and charts that route on its own tile, so a service that does not
-  // report it reads as having no probe rather than as a healthy one.
-  static MetricsOptions Aura(std::string service_name);
 };
 
 // A thread-safe aggregate of served requests, exposable as Prometheus text.
@@ -406,8 +352,11 @@ class MetricsRegistry {
   // without callers coordinating.
   Counter NewCounter(std::string name, std::string help);
   Gauge NewGauge(std::string name, std::string help);
-  Histogram NewHistogram(std::string name, std::string help,
-                         std::vector<double> buckets = DefaultLatencyBuckets());
+  // `buckets` has no default on purpose: the built-in ladder is in
+  // microseconds and shaped for request latency, and silently inheriting it
+  // for a histogram of bytes or queue depth would produce a chart whose bins
+  // mean nothing. Pass HttpLatencyBuckets() for a request-shaped duration.
+  Histogram NewHistogram(std::string name, std::string help, std::vector<double> buckets);
 
   // The Prometheus text exposition format (version 0.0.4), ready to serve.
   // Empty when the registry is disabled.

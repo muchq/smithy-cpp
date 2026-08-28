@@ -42,8 +42,12 @@ RequestObservation Served(std::string method, std::string operation, int status,
 MetricsOptions Enabled() {
   MetricsOptions options;
   options.enabled = true;
+  options.service_name = "todo-service";
   return options;
 }
+
+// The label prefix every built-in series carries, spelled once.
+const std::string kService = R"(service_name="todo-service")";
 
 // The exposition is line-oriented, so assertions read best as "this exact
 // line is present" rather than as substring soup.
@@ -80,11 +84,13 @@ TEST(MetricsRegistryTest, CountsRequestsByMethodOperationAndStatus) {
   registry.Record(Served("POST", "PutThing", 500, microseconds(3000)));
 
   const std::string exposition = registry.Expose();
-  EXPECT_TRUE(HasLine(exposition,
-                      R"(http_requests_total{method="GET",operation="GetThing",status="200"} 2)"))
+  EXPECT_TRUE(HasLine(
+      exposition,
+      R"(http_server_requests_total{service_name="todo-service",http_method="GET",route="GetThing"} 2)"))
       << exposition;
-  EXPECT_TRUE(HasLine(exposition,
-                      R"(http_requests_total{method="POST",operation="PutThing",status="500"} 1)"))
+  EXPECT_TRUE(HasLine(
+      exposition,
+      R"(http_server_requests_total{service_name="todo-service",http_method="POST",route="PutThing"} 1)"))
       << exposition;
 }
 
@@ -92,46 +98,61 @@ TEST(MetricsRegistryTest, EmitsTheFamilyHeadersEvenBeforeAnyTraffic) {
   // A freshly started server should still describe its shape, so a scrape
   // configured against it is verifiable before the first request arrives.
   const std::string exposition = MetricsRegistry(Enabled()).Expose();
-  EXPECT_TRUE(HasLine(exposition, "# TYPE http_requests_total counter")) << exposition;
-  EXPECT_TRUE(HasLine(exposition, "# TYPE http_request_duration_seconds histogram")) << exposition;
-  EXPECT_TRUE(HasLine(exposition, "# TYPE http_requests_in_flight gauge")) << exposition;
-  EXPECT_TRUE(HasLine(exposition, "http_requests_in_flight 0")) << exposition;
+  EXPECT_TRUE(HasLine(exposition, "# TYPE http_server_requests_total counter")) << exposition;
+  EXPECT_TRUE(HasLine(exposition, "# TYPE http_server_request_duration_microseconds histogram"))
+      << exposition;
+  EXPECT_TRUE(HasLine(exposition, "# TYPE http_server_requests_active_gauge gauge")) << exposition;
+  EXPECT_TRUE(HasLine(exposition, "# TYPE http_server_requests_success_total counter"))
+      << exposition;
+  EXPECT_TRUE(HasLine(exposition, "# TYPE http_server_requests_failure_total counter"))
+      << exposition;
+  // The gauge gets no zero baseline: its label is the method, and which
+  // methods a service will see is not knowable before it sees them.
+  EXPECT_EQ(exposition.find("http_server_requests_active_gauge{"), std::string::npos) << exposition;
 }
 
 TEST(MetricsRegistryTest, HistogramBucketsAreCumulativeAndEndAtInf) {
-  MetricsOptions options = Enabled();
-  options.latency_buckets = {0.01, 0.1};
-  MetricsRegistry registry(options);
-  registry.Record(Served("GET", "GetThing", 200, microseconds(5000)));    // 0.005s -> first bucket
-  registry.Record(Served("GET", "GetThing", 200, microseconds(50000)));   // 0.05s  -> second
-  registry.Record(Served("GET", "GetThing", 200, microseconds(500000)));  // 0.5s   -> only +Inf
+  MetricsRegistry registry(Enabled());
+  registry.Record(Served("GET", "GetThing", 200, microseconds(100)));       // the le="100" bucket
+  registry.Record(Served("GET", "GetThing", 200, microseconds(2500)));      // the le="2500" bucket
+  registry.Record(Served("GET", "GetThing", 200, microseconds(50000000)));  // past the ladder
 
   const std::string exposition = registry.Expose();
-  const std::string labels = R"(method="GET",operation="GetThing")";
-  EXPECT_TRUE(
-      HasLine(exposition, "http_request_duration_seconds_bucket{" + labels + R"(,le="0.01"} 1)"))
+  const std::string labels = R"(service_name="todo-service",http_method="GET",route="GetThing")";
+  // Buckets are upper-inclusive, which is what `le` means: exactly 100µs
+  // belongs in the 100 bucket rather than the one above it.
+  EXPECT_TRUE(HasLine(
+      exposition, "http_server_request_duration_microseconds_bucket{" + labels + R"(,le="100"} 1)"))
+      << exposition;
+  EXPECT_TRUE(HasLine(exposition, "http_server_request_duration_microseconds_bucket{" + labels +
+                                      R"(,le="2500"} 2)"))
+      << exposition;
+  // The last finite bound still holds 2: the 50s observation is past it and
+  // lands only in +Inf.
+  EXPECT_TRUE(HasLine(exposition, "http_server_request_duration_microseconds_bucket{" + labels +
+                                      R"(,le="10000000"} 2)"))
+      << exposition;
+  EXPECT_TRUE(HasLine(exposition, "http_server_request_duration_microseconds_bucket{" + labels +
+                                      R"(,le="+Inf"} 3)"))
       << exposition;
   EXPECT_TRUE(
-      HasLine(exposition, "http_request_duration_seconds_bucket{" + labels + R"(,le="0.1"} 2)"))
+      HasLine(exposition, "http_server_request_duration_microseconds_count{" + labels + "} 3"))
       << exposition;
   EXPECT_TRUE(
-      HasLine(exposition, "http_request_duration_seconds_bucket{" + labels + R"(,le="+Inf"} 3)"))
-      << exposition;
-  EXPECT_TRUE(HasLine(exposition, "http_request_duration_seconds_count{" + labels + "} 3"))
-      << exposition;
-  // 0.005 + 0.05 + 0.5, formatted without trailing-zero noise.
-  EXPECT_TRUE(HasLine(exposition, "http_request_duration_seconds_sum{" + labels + "} 0.555"))
+      HasLine(exposition, "http_server_request_duration_microseconds_sum{" + labels + "} 50002600"))
       << exposition;
 }
 
 TEST(MetricsRegistryTest, SubMillisecondLatenciesSurviveTheMicrosecondHook) {
   // The hook is microseconds precisely so cache hits and loopback don't
-  // report as zero (#92); the seconds conversion must not undo that.
+  // report as zero (#92), and the exposition's unit is microseconds too, so
+  // the value travels undivided.
   MetricsRegistry registry(Enabled());
   registry.Record(Served("GET", "GetThing", 200, microseconds(1)));
   EXPECT_TRUE(
       HasLine(registry.Expose(),
-              R"(http_request_duration_seconds_sum{method="GET",operation="GetThing"} 0.000001)"))
+              R"(http_server_request_duration_microseconds_sum{service_name="todo-service",)"
+              R"(http_method="GET",route="GetThing"} 1)"))
       << registry.Expose();
 }
 
@@ -141,8 +162,9 @@ TEST(MetricsRegistryTest, DispatchFailuresCountUnderAnEmptyOperation) {
   // a label at all.
   MetricsRegistry registry(Enabled());
   registry.Record(Served("GET", "", 404, microseconds(100)));
-  EXPECT_TRUE(HasLine(registry.Expose(),
-                      R"(http_requests_total{method="GET",operation="",status="404"} 1)"))
+  EXPECT_TRUE(HasLine(
+      registry.Expose(),
+      R"(http_server_requests_total{service_name="todo-service",http_method="GET",route="unmatched"} 1)"))
       << registry.Expose();
 }
 
@@ -162,9 +184,10 @@ TEST(MetricsRegistryTest, RecordsConcurrentlyWithoutLosingCounts) {
   for (std::thread& thread : threads) {
     thread.join();
   }
-  EXPECT_TRUE(HasLine(registry.Expose(),
-                      R"(http_requests_total{method="GET",operation="GetThing",status="200"} )" +
-                          std::to_string(kThreads * kPerThread)))
+  EXPECT_TRUE(HasLine(
+      registry.Expose(),
+      R"(http_server_requests_total{service_name="todo-service",http_method="GET",route="GetThing"} )" +
+          std::to_string(kThreads * kPerThread)))
       << registry.Expose();
 }
 
@@ -180,8 +203,9 @@ TEST(MetricsRegistryTest, AnInventedMethodCollapsesInsteadOfMintingASeries) {
     registry.Record(Served("BOGUS" + std::to_string(i), "", 405, microseconds(10)));
   }
   const std::string exposition = registry.Expose();
-  EXPECT_TRUE(
-      HasLine(exposition, R"(http_requests_total{method="other",operation="",status="405"} 100)"))
+  EXPECT_TRUE(HasLine(
+      exposition,
+      R"(http_server_requests_total{service_name="todo-service",http_method="CUSTOM",route="unmatched"} 100)"))
       << exposition;
   EXPECT_EQ(exposition.find("BOGUS"), std::string::npos) << exposition;
 }
@@ -192,8 +216,9 @@ TEST(MetricsRegistryTest, LowercaseMethodIsNotFoldedIntoTheRealOne) {
   MetricsRegistry registry(Enabled());
   registry.Record(Served("get", "", 405, microseconds(10)));
   const std::string exposition = registry.Expose();
-  EXPECT_TRUE(
-      HasLine(exposition, R"(http_requests_total{method="other",operation="",status="405"} 1)"))
+  EXPECT_TRUE(HasLine(
+      exposition,
+      R"(http_server_requests_total{service_name="todo-service",http_method="CUSTOM",route="unmatched"} 1)"))
       << exposition;
 }
 
@@ -208,13 +233,16 @@ TEST(MetricsRegistryTest, TheSeriesCapStopsGrowthAndSaysSoOutLoud) {
     registry.Record(Served("GET", "Op" + std::to_string(i), 200, microseconds(10)));
   }
   const std::string exposition = registry.Expose();
-  EXPECT_TRUE(
-      HasLine(exposition, R"(http_requests_total{method="GET",operation="Op0",status="200"} 1)"))
+  EXPECT_TRUE(HasLine(
+      exposition,
+      R"(http_server_requests_total{service_name="todo-service",http_method="GET",route="Op0"} 1)"))
       << exposition;
-  EXPECT_EQ(exposition.find(R"(operation="Op49")"), std::string::npos) << exposition;
+  EXPECT_EQ(exposition.find(R"(route="Op49")"), std::string::npos) << exposition;
   // Four combinations fit; the remaining 46 observations are refused, and
   // each is counted exactly once even though both families turned it away.
-  EXPECT_TRUE(HasLine(exposition, "metrics_observations_dropped_total 46")) << exposition;
+  EXPECT_TRUE(
+      HasLine(exposition, "metrics_observations_dropped_total{service_name=\"todo-service\"} 46"))
+      << exposition;
 }
 
 TEST(MetricsRegistryTest, LabelValuesAreEscapedSoTheScrapeStaysParseable) {
@@ -222,9 +250,9 @@ TEST(MetricsRegistryTest, LabelValuesAreEscapedSoTheScrapeStaysParseable) {
   // stamp anything; an unescaped quote would corrupt the whole scrape.
   MetricsRegistry registry(Enabled());
   registry.Record(Served("GET", R"(We"ird\Op)", 200, microseconds(10)));
-  EXPECT_TRUE(
-      HasLine(registry.Expose(),
-              R"(http_requests_total{method="GET",operation="We\"ird\\Op",status="200"} 1)"))
+  EXPECT_TRUE(HasLine(
+      registry.Expose(),
+      R"(http_server_requests_total{service_name="todo-service",http_method="GET",route="We\"ird\\Op"} 1)"))
       << registry.Expose();
 }
 
@@ -236,10 +264,16 @@ TEST(MetricsRegistryTest, InFlightRisesOnStartAndFallsOnCompletion) {
   MetricsRegistry registry(Enabled());
   registry.RecordStart(RequestStart{.method = "GET", .target = "/a"});
   registry.RecordStart(RequestStart{.method = "GET", .target = "/b"});
-  EXPECT_TRUE(HasLine(registry.Expose(), "http_requests_in_flight 2")) << registry.Expose();
+  EXPECT_TRUE(HasLine(registry.Expose(),
+                      R"(http_server_requests_active_gauge{service_name="todo-service",)"
+                      R"(http_method="GET"} 2)"))
+      << registry.Expose();
 
   registry.Record(Served("GET", "GetThing", 200, microseconds(10)));
-  EXPECT_TRUE(HasLine(registry.Expose(), "http_requests_in_flight 1")) << registry.Expose();
+  EXPECT_TRUE(HasLine(registry.Expose(),
+                      R"(http_server_requests_active_gauge{service_name="todo-service",)"
+                      R"(http_method="GET"} 1)"))
+      << registry.Expose();
 }
 
 TEST(MetricsRegistryTest, CompletionsWithoutStartsLeaveTheGaugeAtZero) {
@@ -248,7 +282,10 @@ TEST(MetricsRegistryTest, CompletionsWithoutStartsLeaveTheGaugeAtZero) {
   MetricsRegistry registry(Enabled());
   registry.Record(Served("GET", "GetThing", 200, microseconds(10)));
   registry.Record(Served("GET", "GetThing", 200, microseconds(10)));
-  EXPECT_TRUE(HasLine(registry.Expose(), "http_requests_in_flight 0")) << registry.Expose();
+  // The series does not exist at all rather than reading -2: nothing ever
+  // started, so there is no method key to have driven negative.
+  EXPECT_EQ(registry.Expose().find("http_server_requests_active_gauge{"), std::string::npos)
+      << registry.Expose();
 }
 
 // ---------------------------------------------------------------------------
@@ -261,8 +298,9 @@ TEST(MetricsRegistryTest, ARejectionIsCountedLikeAnyOtherServedRequest) {
   MetricsRegistry registry(Enabled());
   registry.RecordRejection("POST", 413);
   registry.RecordRejection("POST", 413);
-  EXPECT_TRUE(HasLine(registry.Expose(),
-                      R"(http_requests_total{method="POST",operation="",status="413"} 2)"))
+  EXPECT_TRUE(HasLine(
+      registry.Expose(),
+      R"(http_server_requests_total{service_name="todo-service",http_method="POST",route="unmatched"} 2)"))
       << registry.Expose();
 }
 
@@ -274,11 +312,12 @@ TEST(MetricsRegistryTest, ARejectionBeforeTheMethodParsedIsNotAnInventedVerb) {
   registry.RecordRejection("", 431);
   registry.RecordRejection("BREW", 431);
   const std::string exposition = registry.Expose();
-  EXPECT_TRUE(
-      HasLine(exposition, R"(http_requests_total{method="unparsed",operation="",status="431"} 1)"))
+  EXPECT_TRUE(HasLine(exposition, R"lit(http_server_requests_total{service_name="todo-service",)lit"
+                                  R"lit(http_method="(unparsed)",route="unmatched"} 1)lit"))
       << exposition;
-  EXPECT_TRUE(
-      HasLine(exposition, R"(http_requests_total{method="other",operation="",status="431"} 1)"))
+  EXPECT_TRUE(HasLine(
+      exposition,
+      R"(http_server_requests_total{service_name="todo-service",http_method="CUSTOM",route="unmatched"} 1)"))
       << exposition;
 }
 
@@ -297,16 +336,20 @@ TEST(MetricsRegistryTest, ARejectionFilesNoLatencyAndMovesNoGauge) {
   const std::string exposition = registry.Expose();
   // One real observation, and the mean is still that observation.
   EXPECT_TRUE(HasLine(
-      exposition, R"(http_request_duration_seconds_count{method="POST",operation="AddThing"} 1)"))
+      exposition,
+      R"(http_server_request_duration_microseconds_count{service_name="todo-service",http_method="POST",route="AddThing"} 1)"))
       << exposition;
   EXPECT_TRUE(HasLine(
-      exposition, R"(http_request_duration_seconds_sum{method="POST",operation="AddThing"} 0.2)"))
+      exposition,
+      R"(http_server_request_duration_microseconds_sum{service_name="todo-service",http_method="POST",route="AddThing"} 200000)"))
       << exposition;
   // No latency series was minted for the rejections at all.
-  EXPECT_EQ(exposition.find(R"(http_request_duration_seconds_count{method="POST",operation=""})"),
-            std::string::npos)
+  EXPECT_EQ(
+      exposition.find(
+          R"(http_server_request_duration_microseconds_count{service_name="todo-service",http_method="POST",route="unmatched"})"),
+      std::string::npos)
       << exposition;
-  EXPECT_TRUE(HasLine(exposition, "http_requests_in_flight 0")) << exposition;
+  EXPECT_EQ(exposition.find("http_server_requests_active_gauge{"), std::string::npos) << exposition;
 }
 
 TEST(MetricsRegistryTest, TheRejectionSinkFeedsTheRegistry) {
@@ -323,8 +366,9 @@ TEST(MetricsRegistryTest, TheRejectionSinkFeedsTheRegistry) {
   sink(Rejected{.status = 413, .method = "PUT", .target = "/upload/8f3a2b"});
 
   const std::string exposition = registry->Expose();
-  EXPECT_TRUE(
-      HasLine(exposition, R"(http_requests_total{method="PUT",operation="",status="413"} 1)"))
+  EXPECT_TRUE(HasLine(
+      exposition,
+      R"(http_server_requests_total{service_name="todo-service",http_method="PUT",route="unmatched"} 1)"))
       << exposition;
   // The target is dropped: a flood against distinct paths mints no series.
   EXPECT_EQ(exposition.find("8f3a2b"), std::string::npos) << exposition;
@@ -346,7 +390,7 @@ TEST(MetricsRegistryTest, ACustomCounterJoinsTheSameScrape) {
   EXPECT_TRUE(HasLine(exposition, "orders_processed_total 1")) << exposition;
   EXPECT_TRUE(HasLine(exposition, R"(orders_processed_total{region="us-east"} 4)")) << exposition;
   // The built-in families are still there, whole.
-  EXPECT_TRUE(HasLine(exposition, "# TYPE http_requests_total counter")) << exposition;
+  EXPECT_TRUE(HasLine(exposition, "# TYPE http_server_requests_total counter")) << exposition;
 }
 
 TEST(MetricsRegistryTest, AGaugeGoesUpAndDown) {
@@ -407,8 +451,9 @@ TEST(MetricsRegistryTest, AnUnboundedCustomLabelIsCappedAndAttributed) {
   }
   const std::string exposition = registry.Expose();
   EXPECT_EQ(exposition.find(R"(user_id="49")"), std::string::npos) << exposition;
-  EXPECT_TRUE(
-      HasLine(exposition, R"(metrics_observations_dropped_total{metric="user_events_total"} 46)"))
+  EXPECT_TRUE(HasLine(
+      exposition,
+      R"(metrics_observations_dropped_total{service_name="todo-service",metric="user_events_total"} 46)"))
       << exposition;
 }
 
@@ -479,8 +524,9 @@ TEST(MetricsRegistryTest, DeclaringRespectsTheSeriesCap) {
   }
   const std::string exposition = registry.Expose();
   EXPECT_EQ(exposition.find(R"(user_id="9")"), std::string::npos) << exposition;
-  EXPECT_TRUE(
-      HasLine(exposition, R"(metrics_observations_dropped_total{metric="user_events_total"} 8)"))
+  EXPECT_TRUE(HasLine(
+      exposition,
+      R"(metrics_observations_dropped_total{service_name="todo-service",metric="user_events_total"} 8)"))
       << exposition;
 }
 
@@ -501,7 +547,10 @@ TEST(MetricsRegistryDeathTest, RegisteringAnInvalidOrCollidingNameAborts) {
       { MetricsRegistry(Enabled()).NewCounter("bad-name", "Dashes are not name characters."); },
       "");
   EXPECT_DEATH(
-      { MetricsRegistry(Enabled()).NewCounter("http_requests_total", "Shadows a built-in."); }, "");
+      {
+        MetricsRegistry(Enabled()).NewCounter("http_server_requests_total", "Shadows a built-in.");
+      },
+      "");
   EXPECT_DEATH(
       {
         MetricsRegistry registry(Enabled());
@@ -541,7 +590,7 @@ TEST(MetricsEndpointTest, ServesTheExpositionWithThePrometheusContentType) {
   const http::HttpResponse response = handler(Get("/metrics"));
   EXPECT_EQ(response.status, 200);
   EXPECT_EQ(response.headers.Get("content-type"), "text/plain; version=0.0.4; charset=utf-8");
-  EXPECT_TRUE(HasLine(response.body, "# TYPE http_requests_total counter")) << response.body;
+  EXPECT_TRUE(HasLine(response.body, "# TYPE http_server_requests_total counter")) << response.body;
 }
 
 TEST(MetricsEndpointTest, OtherPathsPassThroughToTheHandler) {
@@ -592,11 +641,12 @@ TEST(MetricsEndpointTest, TheCanonicalChainRecordsTrafficButNotScrapes) {
   handler(Get("/things"));
   const std::string exposition = handler(Get("/metrics")).body;
 
-  EXPECT_TRUE(HasLine(exposition,
-                      R"(http_requests_total{method="GET",operation="GetThing",status="200"} 2)"))
+  EXPECT_TRUE(HasLine(
+      exposition,
+      R"(http_server_requests_total{service_name="todo-service",http_method="GET",route="GetThing"} 2)"))
       << exposition;
-  // Nothing recorded for the scrape itself: no empty-operation series.
-  EXPECT_EQ(exposition.find(R"(operation="",status="200")"), std::string::npos) << exposition;
+  // Nothing recorded for the scrape itself: no /metrics route series.
+  EXPECT_EQ(exposition.find(R"(route="/metrics")"), std::string::npos) << exposition;
 }
 
 TEST(MetricsEndpointTest, RecordMetricsCarriesTheOperationAndStatusFromTheResponse) {
@@ -605,15 +655,16 @@ TEST(MetricsEndpointTest, RecordMetricsCarriesTheOperationAndStatusFromTheRespon
       Chain({MetricsEndpoint(registry), RecordMetrics(registry)}, Handler(503, "GetThing"));
 
   handler(Get("/things"));
-  EXPECT_TRUE(HasLine(handler(Get("/metrics")).body,
-                      R"(http_requests_total{method="GET",operation="GetThing",status="503"} 1)"));
+  EXPECT_TRUE(HasLine(
+      handler(Get("/metrics")).body,
+      R"(http_server_requests_total{service_name="todo-service",http_method="GET",route="GetThing"} 1)"));
 }
 
 TEST(MetricsEndpointTest, HealthProbesAreSeparableFromDispatchFailures) {
   // The reason HealthEndpoint labels its own path. Kubernetes polls a probe
   // every few seconds, so it is often the highest-volume "route" a service
   // has. Sharing the empty operation with 404s means the probe drowns the
-  // signal in `http_requests_total{operation=""}` and the 404 rate
+  // signal in `http_server_requests_total{route="unmatched"}` and the 404 rate
   // cannot be read at all — and the probe's own latency, which is not the
   // service's, contaminates the same duration series.
   auto registry = std::make_shared<MetricsRegistry>(Enabled());
@@ -631,23 +682,29 @@ TEST(MetricsEndpointTest, HealthProbesAreSeparableFromDispatchFailures) {
   handler(Get("/nope"));
 
   const std::string exposition = handler(Get("/metrics")).body;
-  EXPECT_TRUE(
-      HasLine(exposition, R"(http_requests_total{method="GET",operation="/livez",status="200"} 1)"))
+  EXPECT_TRUE(HasLine(
+      exposition,
+      R"(http_server_requests_total{service_name="todo-service",http_method="GET",route="/livez"} 1)"))
       << exposition;
-  EXPECT_TRUE(HasLine(exposition,
-                      R"(http_requests_total{method="GET",operation="/readyz",status="503"} 1)"))
+  EXPECT_TRUE(HasLine(
+      exposition,
+      R"(http_server_requests_total{service_name="todo-service",http_method="GET",route="/readyz"} 1)"))
       << exposition;
   // The 404 keeps the empty operation, and now means only that.
-  EXPECT_TRUE(
-      HasLine(exposition, R"(http_requests_total{method="GET",operation="",status="404"} 1)"))
+  EXPECT_TRUE(HasLine(
+      exposition,
+      R"(http_server_requests_total{service_name="todo-service",http_method="GET",route="unmatched"} 1)"))
       << exposition;
-  // Each probe has its own latency series, so `operation!~"/livez|/readyz"`
-  // is expressible; before the label none of these three could be told apart.
-  EXPECT_TRUE(HasLine(exposition, R"(http_request_duration_seconds_count{method="GET",)"
-                                  R"(operation="/livez"} 1)"))
+  // Each probe has its own latency series, so `route!~"/livez|/readyz"` is
+  // expressible; before the label none of these three could be told apart.
+  // It is also what prom_proxy's `route!="/health"` subtraction depends on.
+  EXPECT_TRUE(HasLine(
+      exposition, R"(http_server_request_duration_microseconds_count{service_name="todo-service",)"
+                  R"(http_method="GET",route="/livez"} 1)"))
       << exposition;
-  EXPECT_TRUE(HasLine(exposition, R"(http_request_duration_seconds_count{method="GET",)"
-                                  R"(operation="/readyz"} 1)"))
+  EXPECT_TRUE(HasLine(
+      exposition, R"(http_server_request_duration_microseconds_count{service_name="todo-service",)"
+                  R"(http_method="GET",route="/readyz"} 1)"))
       << exposition;
 }
 
@@ -660,8 +717,9 @@ TEST(MetricsEndpointTest, TheEndpointLabelsItselfWhenDeliberatelyRecorded) {
 
   handler(Get("/metrics"));
   const std::string exposition = handler(Get("/metrics")).body;
-  EXPECT_TRUE(HasLine(exposition,
-                      R"(http_requests_total{method="GET",operation="/metrics",status="200"} 1)"))
+  EXPECT_TRUE(HasLine(
+      exposition,
+      R"(http_server_requests_total{service_name="todo-service",http_method="GET",route="/metrics"} 1)"))
       << exposition;
 }
 
@@ -676,9 +734,18 @@ TEST(MetricsEndpointTest, AThrowingHandlerStillCompletesItsObservation) {
 
   EXPECT_THROW(handler(Get("/things")), std::runtime_error);
   const std::string exposition = handler(Get("/metrics")).body;
-  EXPECT_TRUE(HasLine(exposition, "http_requests_in_flight 0")) << exposition;
-  EXPECT_TRUE(
-      HasLine(exposition, R"(http_requests_total{method="GET",operation="",status="500"} 1)"))
+  // The start did fire, so the series exists — and it came back down.
+  EXPECT_TRUE(HasLine(exposition,
+                      R"(http_server_requests_active_gauge{service_name="todo-service",)"
+                      R"(http_method="GET"} 0)"))
+      << exposition;
+  EXPECT_TRUE(HasLine(exposition, R"(http_server_requests_total{service_name="todo-service",)"
+                                  R"(http_method="GET",route="unmatched"} 1)"))
+      << exposition;
+  // A thrown handler reports 500, a failure by the 400 boundary.
+  EXPECT_TRUE(HasLine(exposition,
+                      R"(http_server_requests_failure_total{service_name="todo-service",)"
+                      R"(http_method="GET",route="unmatched"} 1)"))
       << exposition;
 }
 
@@ -766,7 +833,8 @@ TEST(DisabledRegistryDeathTest, RegistrationStillValidates) {
   // name only aborted when enabled, enabling it in production would be the
   // first time anyone found out.
   EXPECT_DEATH({ MetricsRegistry().NewCounter("bad-name", "Dashes are not names."); }, "");
-  EXPECT_DEATH({ MetricsRegistry().NewCounter("http_requests_total", "Shadows a built-in."); }, "");
+  EXPECT_DEATH(
+      { MetricsRegistry().NewCounter("http_server_requests_total", "Shadows a built-in."); }, "");
   EXPECT_DEATH(
       {
         MetricsRegistry registry;
@@ -774,30 +842,22 @@ TEST(DisabledRegistryDeathTest, RegistrationStillValidates) {
         registry.NewGauge("thing_total", "One help string.");
       },
       "");
-  EXPECT_DEATH(
-      {
-        MetricsOptions options;
-        options.method_label = "http-method";
-        MetricsRegistry registry(options);
-      },
-      "");
-  MetricsOptions descending;
-  descending.latency_buckets = {1.0, 0.5};
-  EXPECT_DEATH({ MetricsRegistry registry(descending); }, "");
 }
 
 // ---------------------------------------------------------------------------
-// The aura/MoonBase dialect.
+// The MoonBase serving contract, which is the only exposition this emits.
+// Every literal below is pinned on the MoonBase side by
+// //domains/platform/libs/otel_contract. These tests are what stops this rail
+// drifting off it silently — and silence is how such a drift shows up: an
+// empty dashboard panel, indistinguishable from a quiet service.
 // ---------------------------------------------------------------------------
 
-TEST(AuraCompatibilityTest, ExportsTheFiveSharedFamiliesUnderTheirPinnedNames) {
+TEST(ExpositionContractTest, ExportsTheFiveSharedFamiliesUnderTheirPinnedNames) {
   // The names //domains/platform/libs/otel_contract pins across MoonBase's
   // three emitter rails, with the descriptions it pins with them: a
   // collector merging series by name keeps the first description it sees and
   // logs a conflict for every later one that disagrees.
-  MetricsOptions options = MetricsOptions::Aura("todo-service");
-  options.enabled = true;
-  MetricsRegistry registry(options);
+  MetricsRegistry registry(Enabled());
 
   const std::string exposition = registry.Expose();
   EXPECT_TRUE(HasLine(exposition, "# HELP http_server_requests_total HTTP requests received"))
@@ -821,18 +881,16 @@ TEST(AuraCompatibilityTest, ExportsTheFiveSharedFamiliesUnderTheirPinnedNames) {
       << exposition;
   EXPECT_TRUE(HasLine(exposition, "# TYPE http_server_request_duration_microseconds histogram"))
       << exposition;
-  // The default dialect is replaced, not emitted alongside: two families for
-  // one measurement double-count anything that sums across them.
-  EXPECT_EQ(exposition.find("http_request_duration_seconds"), std::string::npos) << exposition;
-  EXPECT_EQ(exposition.find("http_requests_in_flight"), std::string::npos) << exposition;
+  // The registry's own health rides along under a name of its own, outside
+  // the contract.
+  EXPECT_TRUE(HasLine(exposition, "# TYPE metrics_observations_dropped_total counter"))
+      << exposition;
 }
 
-TEST(AuraCompatibilityTest, LabelsEverySeriesTheWayTheDashboardsSelect) {
+TEST(ExpositionContractTest, LabelsEverySeriesTheWayTheDashboardsSelect) {
   // prom_proxy selects `{service_name="x",route!="/health"}` on every query
   // it makes, so all three have to be present and spelled this way.
-  MetricsOptions options = MetricsOptions::Aura("todo-service");
-  options.enabled = true;
-  MetricsRegistry registry(options);
+  MetricsRegistry registry(Enabled());
   registry.Record(Served("GET", "GetThing", 200, microseconds(1500)));
 
   const std::string exposition = registry.Expose();
@@ -851,13 +909,11 @@ TEST(AuraCompatibilityTest, LabelsEverySeriesTheWayTheDashboardsSelect) {
       << exposition;
 }
 
-TEST(AuraCompatibilityTest, SuccessAndFailureSplitAtFourHundred) {
+TEST(ExpositionContractTest, SuccessAndFailureSplitAtFourHundred) {
   // ErrorRatePercent is failure/(success+failure), so the split has to land
   // where the rest of the fleet draws it: 2xx-3xx succeeded, 4xx and 5xx did
   // not. The three counters are views of one tally, so they cannot disagree.
-  MetricsOptions options = MetricsOptions::Aura("todo-service");
-  options.enabled = true;
-  MetricsRegistry registry(options);
+  MetricsRegistry registry(Enabled());
   registry.Record(Served("GET", "GetThing", 200, microseconds(100)));
   registry.Record(Served("GET", "GetThing", 301, microseconds(100)));
   registry.Record(Served("GET", "GetThing", 404, microseconds(100)));
@@ -875,14 +931,12 @@ TEST(AuraCompatibilityTest, SuccessAndFailureSplitAtFourHundred) {
   EXPECT_EQ(exposition.find("status="), std::string::npos) << exposition;
 }
 
-TEST(AuraCompatibilityTest, TheActiveGaugeIsKeyedByMethodAndNeverByRoute) {
+TEST(ExpositionContractTest, TheActiveGaugeIsKeyedByMethodAndNeverByRoute) {
   // It moves at request start, before dispatch, where no bounded route is
   // known. Every rail leaves the route off it for that reason, and
   // prom_proxy's `route!="/health"` matcher passes a series without the
   // label through untouched — which is why the same filter is safe on it.
-  MetricsOptions options = MetricsOptions::Aura("todo-service");
-  options.enabled = true;
-  MetricsRegistry registry(options);
+  MetricsRegistry registry(Enabled());
   registry.RecordStart(RequestStart{.method = "GET", .target = "/things/1"});
   registry.RecordStart(RequestStart{.method = "POST", .target = "/things"});
   registry.RecordStart(RequestStart{.method = "GET", .target = "/things/2"});
@@ -915,13 +969,11 @@ TEST(AuraCompatibilityTest, TheActiveGaugeIsKeyedByMethodAndNeverByRoute) {
       << exposition;
 }
 
-TEST(AuraCompatibilityTest, UsesTheRouteAndMethodSentinelsTheOtherRailsAgreedOn) {
+TEST(ExpositionContractTest, UsesTheRouteAndMethodSentinelsTheOtherRailsAgreedOn) {
   // Three constants that have to be byte-equal across the rails, because a
   // fleet-wide "unmatched traffic" query only means one thing if every
   // service spells it the same way.
-  MetricsOptions options = MetricsOptions::Aura("todo-service");
-  options.enabled = true;
-  MetricsRegistry registry(options);
+  MetricsRegistry registry(Enabled());
   registry.Record(Served("GET", "", 404, microseconds(10)));
   registry.Record(Served("BREW", "GetThing", 200, microseconds(10)));
   registry.RecordRejection("", 431);
@@ -944,15 +996,13 @@ TEST(AuraCompatibilityTest, UsesTheRouteAndMethodSentinelsTheOtherRailsAgreedOn)
   EXPECT_EQ(exposition.find(R"(route="")"), std::string::npos) << exposition;
 }
 
-TEST(AuraCompatibilityTest, TheHealthProbeLandsOnTheRouteThePanelsSubtract) {
+TEST(ExpositionContractTest, TheHealthProbeLandsOnTheRouteThePanelsSubtract) {
   // The composition that makes the /health literal real: prom_proxy
   // subtracts route!="/health" from every serving number and charts that
   // route on its own Probes tile, so a service that never reports it reads
   // as having no probe rather than as a healthy one. HealthEndpoint's
   // default path is already the literal.
-  MetricsOptions options = MetricsOptions::Aura("todo-service");
-  options.enabled = true;
-  auto registry = std::make_shared<MetricsRegistry>(options);
+  auto registry = std::make_shared<MetricsRegistry>(Enabled());
   http::RequestHandler handler = Chain(
       {MetricsEndpoint(registry), RecordMetrics(registry), HealthEndpoint()}, Handler(404, ""));
 
@@ -970,16 +1020,14 @@ TEST(AuraCompatibilityTest, TheHealthProbeLandsOnTheRouteThePanelsSubtract) {
       << exposition;
 }
 
-TEST(AuraCompatibilityTest, UsesTheMicrosecondBucketLadderTheRailsShare) {
+TEST(ExpositionContractTest, UsesTheMicrosecondBucketLadderTheRailsShare) {
   // histogram_quantile reads `le` off bucket counts, so p95 only compares
   // like with like when the boundaries match. These are pinned equal across
   // the three rails by //domains/platform/libs/otel_contract; a service on a
   // different ladder charts a quantile computed against different bins than
   // everything beside it.
-  MetricsOptions options = MetricsOptions::Aura("todo-service");
-  options.enabled = true;
-  MetricsRegistry registry(options);
-  EXPECT_EQ(options.latency_buckets,
+  MetricsRegistry registry(Enabled());
+  EXPECT_EQ(HttpLatencyBuckets(),
             (std::vector<double>{100, 250, 500, 1000, 2500, 5000, 10000, 25000, 50000, 100000,
                                  250000, 500000, 1000000, 2500000, 10000000}));
 
@@ -996,12 +1044,10 @@ TEST(AuraCompatibilityTest, UsesTheMicrosecondBucketLadderTheRailsShare) {
       << exposition;
 }
 
-TEST(AuraCompatibilityTest, ApplicationMetricsStillShareTheScrape) {
+TEST(ExpositionContractTest, ApplicationMetricsStillShareTheScrape) {
   // Switching dialects changes the built-in vocabulary, not the endpoint: a
   // service's own numbers still ride the same target.
-  MetricsOptions options = MetricsOptions::Aura("todo-service");
-  options.enabled = true;
-  MetricsRegistry registry(options);
+  MetricsRegistry registry(Enabled());
   auto orders = registry.NewCounter("orders_processed_total", "Orders processed.");
   orders.Increment();
 
@@ -1010,23 +1056,28 @@ TEST(AuraCompatibilityTest, ApplicationMetricsStillShareTheScrape) {
   EXPECT_TRUE(HasLine(exposition, "# TYPE http_server_requests_total counter")) << exposition;
 }
 
-TEST(AuraCompatibilityDeathTest, ShadowingARenamedBuiltInStillAborts) {
-  // The reserved set follows the configured names rather than the defaults,
-  // so the dialect cannot open a hole in the collision check.
-  MetricsOptions options = MetricsOptions::Aura("todo-service");
-  options.enabled = true;
-  EXPECT_DEATH(
-      {
-        MetricsRegistry registry(options);
-        registry.NewCounter("http_server_requests_success_total", "Shadows a built-in.");
-      },
-      "");
-  // And the old default names are no longer reserved in this dialect, since
-  // nothing emits them any more.
-  MetricsRegistry registry(options);
-  auto shadow = registry.NewCounter("http_requests_total", "Free in this dialect.");
-  shadow.Increment();
-  EXPECT_TRUE(HasLine(registry.Expose(), "http_requests_total 1")) << registry.Expose();
+TEST(ExpositionContractDeathTest, EveryBuiltInNameIsReserved) {
+  // All six, not just the ones a test happened to name: a family shadowing
+  // any of them appears twice with two TYPE lines, which Prometheus rejects
+  // whole rather than per line.
+  for (const std::string name :
+       {"http_server_requests_total", "http_server_requests_success_total",
+        "http_server_requests_failure_total", "http_server_requests_active_gauge",
+        "http_server_request_duration_microseconds", "metrics_observations_dropped_total"}) {
+    EXPECT_DEATH(
+        { MetricsRegistry(Enabled()).NewCounter(name, "Shadows a built-in."); }, "")
+        << name;
+  }
+}
+
+TEST(ExpositionContractDeathTest, AnEnabledRegistryWithoutAServiceNameAborts) {
+  // Every dashboard query selects on service_name, so a service reporting
+  // the empty string is scraped, stored, and absent from all of them —
+  // success everywhere except the panel nobody is watching yet.
+  EXPECT_DEATH({ MetricsRegistry registry(MetricsOptions{.enabled = true}); }, "");
+  // Disabled it is not required: nothing is exposed to be unfindable.
+  MetricsRegistry disabled{};
+  EXPECT_FALSE(disabled.enabled());
 }
 
 }  // namespace

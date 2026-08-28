@@ -1273,7 +1273,7 @@ TEST(BeastTransportTest, TheMetricsEndpointScrapesOverTheRealTransport) {
   // content type reaches the client, and the traffic counted is the traffic
   // the transport actually served.
   auto metrics = std::make_shared<smithy::server::MetricsRegistry>(
-      smithy::server::MetricsOptions{.enabled = true});
+      smithy::server::MetricsOptions{.enabled = true, .service_name = "todo-service"});
   BeastServerTransport server;
   ASSERT_TRUE(server
                   .Start(smithy::server::Chain({smithy::server::MetricsEndpoint(metrics),
@@ -1300,8 +1300,10 @@ TEST(BeastTransportTest, TheMetricsEndpointScrapesOverTheRealTransport) {
             std::string::npos)
       << scrape;
   const std::string body = scrape.substr(header_end + 4);
-  EXPECT_NE(body.find(R"(http_requests_total{method="GET",operation="GetThing",status="200"} 1)"),
-            std::string::npos)
+  EXPECT_NE(
+      body.find(
+          R"(http_server_requests_total{service_name="todo-service",http_method="GET",route="GetThing"} 1)"),
+      std::string::npos)
       << body;
   // The scrape itself went through MetricsEndpoint, which sits outside
   // RecordMetrics — so it answered without counting itself.
@@ -1317,7 +1319,7 @@ TEST(BeastTransportTest, AnOverLimitRejectionReachesTheMetricsScrape) {
   // on_rejected is what makes it visible, and only a real transport proves
   // the wiring — the rejection has no in-process caller to fake.
   auto metrics = std::make_shared<smithy::server::MetricsRegistry>(
-      smithy::server::MetricsOptions{.enabled = true});
+      smithy::server::MetricsOptions{.enabled = true, .service_name = "todo-service"});
   BeastServerTransport server(BeastServerTransport::Options{
       .max_body_bytes = 1024, .on_rejected = smithy::server::RecordRejections(metrics)});
   ASSERT_TRUE(server
@@ -1345,14 +1347,18 @@ TEST(BeastTransportTest, AnOverLimitRejectionReachesTheMetricsScrape) {
   const auto header_end = scrape.find("\r\n\r\n");
   ASSERT_NE(header_end, std::string::npos) << scrape;
   const std::string body = scrape.substr(header_end + 4);
-  EXPECT_NE(body.find(R"(http_requests_total{method="POST",operation="",status="413"} 1)"),
-            std::string::npos)
+  EXPECT_NE(
+      body.find(
+          R"(http_server_requests_total{service_name="todo-service",http_method="POST",route="unmatched"} 1)"),
+      std::string::npos)
       << body;
   // Counted, but not filed as a latency observation: a request refused at
   // parse time has no service latency, and zeros here would flatter the
   // panel during exactly the flood it should expose.
-  EXPECT_EQ(body.find(R"(http_request_duration_seconds_count{method="POST",operation=""})"),
-            std::string::npos)
+  EXPECT_EQ(
+      body.find(
+          R"(http_server_request_duration_microseconds_count{service_name="todo-service",http_method="POST",route="unmatched"})"),
+      std::string::npos)
       << body;
 
   server.Stop();
@@ -1363,7 +1369,7 @@ TEST(BeastTransportTest, TheMetricsEndpointsHeadReportsTheGetsLength) {
   // HEAD itself, so it is on the handler to hand the transport a full body
   // and let the transport withhold the octets while keeping the length.
   auto metrics = std::make_shared<smithy::server::MetricsRegistry>(
-      smithy::server::MetricsOptions{.enabled = true});
+      smithy::server::MetricsOptions{.enabled = true, .service_name = "todo-service"});
   BeastServerTransport server;
   ASSERT_TRUE(server
                   .Start(smithy::server::Chain({smithy::server::MetricsEndpoint(metrics)},

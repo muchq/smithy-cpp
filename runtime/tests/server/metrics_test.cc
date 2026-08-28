@@ -14,6 +14,7 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -1078,6 +1079,107 @@ TEST(ExpositionContractDeathTest, AnEnabledRegistryWithoutAServiceNameAborts) {
   // Disabled it is not required: nothing is exposed to be unfindable.
   MetricsRegistry disabled{};
   EXPECT_FALSE(disabled.enabled());
+}
+
+// Four pins adapted from MoonBase's own rails (aura/middleware_test.cc and
+// futility/otel/http_metrics_test.cc). Each catches a class of drift that
+// the per-value assertions above would miss, and each is asserted here
+// against the rendered scrape rather than against a recording sink — which
+// is strictly stronger, since the scrape is what Prometheus actually reads.
+
+// Every sample line of a built-in family, stripped of its value.
+std::vector<std::string> BuiltInSampleLines(const std::string& exposition) {
+  std::vector<std::string> lines;
+  std::istringstream stream(exposition);
+  for (std::string line; std::getline(stream, line);) {
+    if (line.starts_with("http_server_")) {
+      lines.push_back(line);
+    }
+  }
+  return lines;
+}
+
+TEST(ExpositionContractTest, NoSeriesCarriesTheOldMethodSpelling) {
+  // futility's #1305 pin, which it needed because that rail alone had
+  // historically spelled the label `method`. A single stray old spelling
+  // forks every dashboard series for this service — the query selects
+  // http_method, finds nothing, and charts an empty panel. Swept across all
+  // five families rather than asserted per call site, so a family added
+  // later cannot quietly reintroduce it.
+  MetricsRegistry registry(Enabled());
+  registry.RecordStart(RequestStart{.method = "GET", .target = "/things"});
+  registry.Record(Served("GET", "GetThing", 200, microseconds(1000)));
+  registry.Record(Served("POST", "PutThing", 500, microseconds(1000)));
+  registry.RecordRejection("PUT", 413);
+
+  const std::vector<std::string> lines = BuiltInSampleLines(registry.Expose());
+  ASSERT_FALSE(lines.empty());
+  for (const std::string& line : lines) {
+    EXPECT_EQ(line.find("{method=\""), std::string::npos) << line;
+    EXPECT_EQ(line.find(",method=\""), std::string::npos) << line;
+    EXPECT_NE(line.find("service_name=\"todo-service\""), std::string::npos) << line;
+    EXPECT_NE(line.find("http_method=\""), std::string::npos) << line;
+  }
+}
+
+TEST(ExpositionContractTest, AQueryStringDoesNotDefeatTheHealthRoute) {
+  // The probe is polled with a query string by plenty of orchestrators. If
+  // that pushed it off the /health route, prom_proxy's subtraction would
+  // stop matching and the probe's volume would silently rejoin the serving
+  // numbers — the exact arithmetic error the route label exists to prevent.
+  auto registry = std::make_shared<MetricsRegistry>(Enabled());
+  http::RequestHandler handler = Chain(
+      {MetricsEndpoint(registry), RecordMetrics(registry), HealthEndpoint()}, Handler(404, ""));
+
+  handler(Get("/health?probe=1"));
+  EXPECT_TRUE(HasLine(handler(Get("/metrics")).body,
+                      R"(http_server_requests_total{service_name="todo-service",)"
+                      R"(http_method="GET",route="/health"} 1)"))
+      << handler(Get("/metrics")).body;
+}
+
+TEST(ExpositionContractTest, ScannerPathsCollapseIntoOneSeries) {
+  // The same cardinality rule the cap backstops, stated the way an operator
+  // meets it: a scanner walking distinct paths must not mint a series per
+  // path. The cap would eventually stop it, but only after the damage —
+  // collapsing at the label is what keeps it from starting.
+  auto registry = std::make_shared<MetricsRegistry>(Enabled());
+  http::RequestHandler handler =
+      Chain({MetricsEndpoint(registry), RecordMetrics(registry)}, Handler(404, ""));
+
+  for (const std::string target : {"/wp-login.php", "/admin/config", "/v1/nope?x=1"}) {
+    handler(Get(target));
+  }
+
+  const std::string exposition = handler(Get("/metrics")).body;
+  EXPECT_TRUE(HasLine(exposition, R"(http_server_requests_total{service_name="todo-service",)"
+                                  R"(http_method="GET",route="unmatched"} 3)"))
+      << exposition;
+  for (const std::string fragment : {"wp-login", "admin/config", "v1/nope"}) {
+    EXPECT_EQ(exposition.find(fragment), std::string::npos)
+        << "a scanned path reached a label: " << exposition;
+  }
+}
+
+TEST(ExpositionContractTest, InventedMethodsCollapseOnTheGaugeToo) {
+  // The method label is bounded on the counters (asserted above), but the
+  // gauge is keyed by method as well and moves at request *start* — so a
+  // flood of invented verbs would mint a gauge series each unless the same
+  // normalization runs there. Lowercase "get" is deliberately in the set:
+  // methods are case-sensitive, so it is an invented token, not GET.
+  MetricsRegistry registry(Enabled());
+  for (const std::string method : {"FOOBAR1", "FOOBAR2", "get"}) {
+    registry.RecordStart(RequestStart{.method = method, .target = "/echo"});
+  }
+
+  const std::string exposition = registry.Expose();
+  EXPECT_TRUE(HasLine(exposition,
+                      R"(http_server_requests_active_gauge{service_name="todo-service",)"
+                      R"(http_method="CUSTOM"} 3)"))
+      << exposition;
+  for (const std::string token : {"FOOBAR1", "FOOBAR2", R"(http_method="get")"}) {
+    EXPECT_EQ(exposition.find(token), std::string::npos) << exposition;
+  }
 }
 
 }  // namespace

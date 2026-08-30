@@ -350,6 +350,25 @@ throws. An optional `on_start` callback fires before dispatch (method and
 target only), enabling in-flight gauges; start/complete always pair, even
 when the handler throws.
 
+It also reports `request_bytes` and `response_bytes`, a `handler_threw` flag,
+and `client` — the ADR-0012 derived client (address plus provenance), **not**
+the raw `x-forwarded-for`, which a direct client can forge. That is the
+identity `PerClientRateLimit` keys on, so it is the one that answers "whose
+bucket did that 429 come from"; pass `Observe` the same `TrustedProxies` you
+give the limiter or the two will disagree. Unset means
+`TrustedProxies::None()` — the deliberate direct-connect statement, under
+which the peer is the client and the header is ignored wholly. Watch the
+distribution of `client.source`: every request reporting `kDirectPeer` with
+one address means you are behind a proxy and did not say so.
+
+`handler_threw` separates "we crashed" from "the handler deliberately
+answered 500" — both report status 500 with no operation, and an access log
+that cannot tell them apart sends whoever reads a 5xx spike looking for the
+wrong thing. A thrown request has no response, so its `response_bytes` is 0;
+`handler_threw` is what makes that an absence rather than an empty body. The
+exception text stays on the transport's containment log, which carries the
+same trace id.
+
 **Client:** two ready-made interceptors in
 `smithy/client/observability.h`:
 

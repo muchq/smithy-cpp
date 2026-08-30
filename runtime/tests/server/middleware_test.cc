@@ -103,6 +103,120 @@ TEST(ObserveTest, ReportsMethodTargetStatusAndDuration) {
   EXPECT_EQ(observations[0].duration, std::chrono::microseconds(750));
 }
 
+TEST(ObserveTest, ReportsBodySizesOnBothSides) {
+  std::vector<RequestObservation> observations;
+  auto handler = Chain({Observe([&](const RequestObservation& o) { observations.push_back(o); })},
+                       [](const http::HttpRequest&) { return Ok("twelve chars"); });
+
+  http::HttpRequest request;
+  request.method = "POST";
+  request.target = "/things";
+  request.body = "four";
+  (void)handler(request);
+
+  ASSERT_EQ(observations.size(), 1u);
+  EXPECT_EQ(observations[0].request_bytes, 4u);
+  EXPECT_EQ(observations[0].response_bytes, 12u);
+}
+
+TEST(ObserveTest, AThrownHandlerIsDistinguishableFromADeliberateFiveHundred) {
+  // Both report 500 with no operation, and an access log that cannot tell
+  // them apart sends whoever reads a 5xx spike looking for the wrong thing.
+  // The thrown one also has no response, so its response_bytes is 0 —
+  // handler_threw is what says that is an absence rather than an empty body.
+  std::vector<RequestObservation> observations;
+  auto thrown = Chain({Observe([&](const RequestObservation& o) { observations.push_back(o); })},
+                      [](const http::HttpRequest&) -> http::HttpResponse {
+                        throw std::runtime_error("handler exploded");
+                      });
+  EXPECT_THROW((void)thrown({}), std::runtime_error);
+
+  auto deliberate =
+      Chain({Observe([&](const RequestObservation& o) { observations.push_back(o); })},
+            [](const http::HttpRequest&) {
+              http::HttpResponse response;
+              response.status = 500;
+              response.body = "sorry";
+              return response;
+            });
+  (void)deliberate({});
+
+  ASSERT_EQ(observations.size(), 2u);
+  EXPECT_EQ(observations[0].status, 500);
+  EXPECT_TRUE(observations[0].handler_threw);
+  EXPECT_EQ(observations[0].response_bytes, 0u);
+
+  EXPECT_EQ(observations[1].status, 500);
+  EXPECT_FALSE(observations[1].handler_threw);
+  EXPECT_EQ(observations[1].response_bytes, 5u);
+}
+
+TEST(ObserveTest, TheClientIsTheDerivedOneNotTheForgeableHeader) {
+  // The gap this closes: PerClientRateLimit keys on the ADR-0012 derived
+  // client, so an observation carrying the raw x-forwarded-for could not say
+  // whose bucket a 429 came from. Behind a trusted proxy the header's client
+  // entry is the answer; the proxy's own address is not.
+  auto trusted = http::TrustedProxies::Parse({"10.0.0.0/8"});
+  ASSERT_TRUE(trusted.ok()) << trusted.error().message();
+
+  std::vector<RequestObservation> observations;
+  auto handler = Chain({Observe([&](const RequestObservation& o) { observations.push_back(o); },
+                                nullptr, nullptr, *trusted)},
+                       [](const http::HttpRequest&) { return Ok("served"); });
+
+  http::HttpRequest request;
+  request.method = "GET";
+  request.target = "/things";
+  request.peer_address = "10.1.2.3";  // the proxy, inside the trust set
+  request.headers.Set("x-forwarded-for", "203.0.113.7, 10.1.2.3");
+  (void)handler(request);
+
+  ASSERT_EQ(observations.size(), 1u);
+  EXPECT_EQ(observations[0].client.address, "203.0.113.7");
+  EXPECT_EQ(observations[0].client.source, http::DerivedClient::Source::kForwarded);
+}
+
+TEST(ObserveTest, AnUntrustedPeerIsTheClientAndItsHeaderIsIgnored) {
+  // The forgery case, and the reason the raw header is the wrong thing to
+  // log: a direct client claiming to be someone else must not be believed.
+  // Unset trust is TrustedProxies::None(), so every peer is untrusted.
+  std::vector<RequestObservation> observations;
+  auto handler = Chain({Observe([&](const RequestObservation& o) { observations.push_back(o); })},
+                       [](const http::HttpRequest&) { return Ok("served"); });
+
+  http::HttpRequest request;
+  request.method = "GET";
+  request.target = "/things";
+  request.peer_address = "198.51.100.9";
+  request.headers.Set("x-forwarded-for", "1.2.3.4");
+  (void)handler(request);
+
+  ASSERT_EQ(observations.size(), 1u);
+  EXPECT_EQ(observations[0].client.address, "198.51.100.9");
+  EXPECT_EQ(observations[0].client.source, http::DerivedClient::Source::kUntrustedHeaderIgnored)
+      << "the forged header was believed";
+}
+
+TEST(ObserveTest, TheClientIsReportedOnTheThrownPathToo) {
+  // The 500s are exactly when someone wants to know who was calling.
+  std::vector<RequestObservation> observations;
+  auto handler = Chain({Observe([&](const RequestObservation& o) { observations.push_back(o); })},
+                       [](const http::HttpRequest&) -> http::HttpResponse {
+                         throw std::runtime_error("handler exploded");
+                       });
+
+  http::HttpRequest request;
+  request.method = "GET";
+  request.target = "/boom";
+  request.peer_address = "198.51.100.9";
+  request.body = "payload";
+  EXPECT_THROW((void)handler(request), std::runtime_error);
+
+  ASSERT_EQ(observations.size(), 1u);
+  EXPECT_EQ(observations[0].client.address, "198.51.100.9");
+  EXPECT_EQ(observations[0].request_bytes, 7u);
+}
+
 TEST(ObserveTest, TracesAreNeverEmptyWhenServedThroughATransport) {
   // ADR-0011: the transport ingress (server_dispatch.h) mints a root
   // traceparent when the client sent none, so an Observe composed under any

@@ -161,7 +161,8 @@ Middleware HealthEndpoint(std::string path, std::vector<ReadinessCheck> checks) 
 
 Middleware Observe(std::function<void(const RequestObservation&)> on_complete,
                    std::function<void(const RequestStart&)> on_start,
-                   std::function<std::chrono::steady_clock::time_point()> now) {
+                   std::function<std::chrono::steady_clock::time_point()> now,
+                   http::TrustedProxies trusted) {
   if (on_complete == nullptr) {
     smithy::internal::Fatal("smithy::server::Observe: on_complete may not be null");
   }
@@ -169,8 +170,9 @@ Middleware Observe(std::function<void(const RequestObservation&)> on_complete,
     now = [] { return std::chrono::steady_clock::now(); };
   }
   return [on_complete = std::move(on_complete), on_start = std::move(on_start),
-          now = std::move(now)](http::RequestHandler next) {
-    return [on_complete, on_start, now, next = std::move(next)](const http::HttpRequest& request) {
+          now = std::move(now), trusted = std::move(trusted)](http::RequestHandler next) {
+    return [on_complete, on_start, now, trusted,
+            next = std::move(next)](const http::HttpRequest& request) {
       if (on_start != nullptr) {
         CallContained(on_start, RequestStart{request.method, request.target}, "Observe on_start");
       }
@@ -178,6 +180,11 @@ Middleware Observe(std::function<void(const RequestObservation&)> on_complete,
       observation.method = request.method;
       observation.target = request.target;
       observation.trace_parent = request.headers.Get("traceparent").value_or("");
+      observation.request_bytes = request.body.size();
+      // Derived once here rather than per sink: the walk parses
+      // x-forwarded-for, and two sinks deriving it independently could
+      // disagree if they were handed different trust boundaries.
+      observation.client = http::DeriveClient(request, trusted);
       const auto start = now();
       http::HttpResponse response;
 #if defined(__cpp_exceptions)
@@ -189,6 +196,9 @@ Middleware Observe(std::function<void(const RequestObservation&)> on_complete,
         // containment (server_dispatch.h). Under -fno-exceptions next()
         // cannot throw, so this pairing is unreachable and compiled out.
         observation.status = 500;
+        observation.handler_threw = true;
+        // response_bytes stays 0: there is no response. handler_threw is what
+        // tells that apart from a handler that answered with an empty body.
         observation.duration = std::chrono::duration_cast<std::chrono::microseconds>(now() - start);
         CallContained(on_complete, observation, "Observe on_complete");
         throw;
@@ -198,6 +208,7 @@ Middleware Observe(std::function<void(const RequestObservation&)> on_complete,
 #endif
       observation.operation = response.operation;
       observation.status = response.status;
+      observation.response_bytes = response.body.size();
       observation.duration = std::chrono::duration_cast<std::chrono::microseconds>(now() - start);
       CallContained(on_complete, observation, "Observe on_complete");
       return response;

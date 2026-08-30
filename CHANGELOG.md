@@ -61,6 +61,22 @@ policy in [docs/versioning.md](docs/versioning.md).
   Observability section of
   [docs/production-guide.md](docs/production-guide.md).
 
+- **`RequestObservation` carries what an access log needs** (#202).
+  `Observe` reported six fields, which was enough for metrics and not for the
+  other thing every server does with a per-request hook. MoonBase's aura says
+  so in its own comment: its access log is *kept separate from `Observe`*
+  because the observation lacks the response size and the forwarded client,
+  so the chain runs two clocks per request measuring the same interval. Worse,
+  the raw `x-forwarded-for` it logs instead is not the ADR-0012 derived client
+  `PerClientRateLimit` keys on, so "whose bucket did that 429 come from" was
+  unanswerable. The observation now adds `request_bytes`, `response_bytes`,
+  `handler_threw`, and `client` — the derived client with its provenance,
+  never the forgeable header. `Observe` takes the trust boundary as a fourth
+  defaulted parameter (`TrustedProxies::None()`, the direct-connect
+  statement); pass it the same one given to the limiter. `handler_threw`
+  separates a contained crash from a deliberate 500, which report identically
+  otherwise.
+
 ### Fixed
 
 - **Health probes are distinguishable from dispatch failures in observability

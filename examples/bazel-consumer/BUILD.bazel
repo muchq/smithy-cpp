@@ -147,6 +147,22 @@ cc_test(
 )
 
 cc_test(
+    name = "access_log_acceptance_test",
+    size = "small",
+    srcs = ["access_log_acceptance_test.cc"],
+    copts = SMITHY_COPTS,
+    deps = [
+        ":todo_client",
+        ":todo_server",
+        "@googletest//:gtest_main",
+        "@smithy_cpp//runtime:client",
+        "@smithy_cpp//runtime:http",
+        "@smithy_cpp//runtime:http_beast",
+        "@smithy_cpp//runtime:server",
+    ],
+)
+
+cc_test(
     name = "todo_beast_acceptance_test",
     size = "small",
     srcs = ["todo_beast_acceptance_test.cc"],

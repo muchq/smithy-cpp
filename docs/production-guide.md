@@ -205,16 +205,24 @@ transport.Start(smithy::server::Chain(
          trusted, std::chrono::seconds(30)),
      // Observe everything admitted — health probes included, reporting
      // `operation` as their own path so a dashboard can filter them out.
-     // on_start (optional) enables an in-flight gauge; on_complete carries
-     // method/target/operation/status/duration/trace_parent.
+     // Hand it the SAME trust boundary as the limiter: without it the
+     // observation reports the peer while the limiter keyed on the
+     // forwarded client, and the log cannot answer a question about the
+     // limiter's own decision.
      smithy::server::Observe(
          [](const smithy::server::RequestObservation& o) {
-           // gauge -1; count 1; latency o.duration — feed any backend.
+           // One access-log record: o.method, o.target, o.operation,
+           // o.status, o.duration, o.trace_parent, o.request_bytes,
+           // o.response_bytes, o.handler_threw (a contained crash, not a
+           // deliberate 500), and o.client — the derived client with its
+           // .source provenance, which is the bucket the limiter keyed on.
+           // Also gauge -1; count 1; latency o.duration.
          },
          [](const smithy::server::RequestStart& s) {
            // gauge +1 (labeled by s.method/s.target; the operation is not
            // known until the router runs).
-         }),
+         },
+         nullptr, trusted),
      // Liveness: GET or HEAD /livez -> 200 {"status":"healthy"}. A HEAD
      // gets that body's Content-Length and none of its octets, framed by
      // the transport; everything else passes through to the router.
@@ -230,7 +238,9 @@ transport.Start(smithy::server::Chain(
 
 The first middleware in the chain is outermost: it sees the request first and
 can short-circuit before anything below it runs (so the limiter's rejections
-never reach `Observe` — track rejection rates in the limiter itself). Because
+never reach `Observe` — track rejection rates in the limiter itself, or
+compose `Observe` *outside* the limiter, which logs the 429s with the client
+they were rejected for at the cost of observing traffic you refused). Because
 admission keys on the derived client address, health probes budget as their
 real source (the node or balancer address the transport saw) rather than
 sharing one spoofable key with abusive traffic; if even that source's own
@@ -261,12 +271,11 @@ address changed; the CIDR didn't) fails silently: the spoof defense ignores
 the header on every request and all traffic collapses onto the proxy's one
 key. The fingerprint is visible in `smithy::http::DeriveClient` — the
 richer form of `ClientAddress` that also reports *how* the address was
-derived. Count its `source` where the request is still in hand — a
-one-line middleware wrapping the chain above; `Observe`'s sink sees only
-the finished observation, not the request. On the dashboard: behind a
-proxy, ~100% `kUntrustedHeaderIgnored` means the trust set no longer
-matches the topology, and ~100% `kTrustedTier` means the proxy is not
-appending `x-forwarded-for`.
+derived. `Observe` reports it directly — `o.client.source`, derived against
+the `TrustedProxies` you passed it — so counting it needs no extra
+middleware. On the dashboard: behind a proxy, ~100% `kUntrustedHeaderIgnored`
+means the trust set no longer matches the topology, and ~100% `kTrustedTier`
+means the proxy is not appending `x-forwarded-for`.
 
 **Plumbing the trust set.** The boundary is deployment config; the
 convention is a `TRUSTED_PROXY_CIDRS` environment variable holding a

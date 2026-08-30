@@ -264,9 +264,9 @@ struct MetricsOptions {
 //     `operation` is the bounded stand-in — the generated router stamps it
 //     from the model, and it is empty for the 404/405/400 dispatch failures
 //     that never reached an operation.
-//   - `method` arrives from the wire, so it is whatever a client typed.
-//     Anything outside the standard set collapses to "other" rather than
-//     minting a series per invented verb.
+//   - `http_method` arrives from the wire, so it is whatever a client typed.
+//     Anything outside the nine RFC 9110 verbs collapses to "CUSTOM" rather
+//     than minting a series per invented verb.
 //   - Past `max_series` distinct label combinations the registry stops
 //     minting new ones and counts each refused observation once in
 //     `metrics_observations_dropped_total`. With the two rules above
@@ -336,10 +336,12 @@ class MetricsRegistry {
   // hammered.
   //
   // `method` is whatever the parser had reached — normalized like every
-  // other method label, and empty becomes "unparsed" rather than "other",
+  // other method label, and empty becomes "(unparsed)" rather than "CUSTOM",
   // since a 431 can fire mid-headers and "never parsed" is a different
   // diagnosis from "invented verb". The rejected target is deliberately
-  // dropped: a flood against distinct paths must not mint a series each.
+  // dropped: a flood against distinct paths must not mint a series each, and
+  // the route reports the unmatched sentinel like any other unrouted
+  // request.
   void RecordRejection(std::string_view method, int status);
 
   // Mints an application metric family. The name must be a valid Prometheus
@@ -367,43 +369,53 @@ class MetricsRegistry {
                                                    internal::MetricFamily::Kind kind,
                                                    std::vector<double> buckets);
 
-  struct CountKey {
-    std::string method;
-    std::string route;
-    int status = 0;
-
-    friend bool operator<(const CountKey& a, const CountKey& b) {
-      return std::tie(a.method, a.route, a.status) < std::tie(b.method, b.route, b.status);
-    }
-  };
-
-  struct LatencyKey {
+  struct RouteKey {
     std::string method;
     std::string route;
 
-    friend bool operator<(const LatencyKey& a, const LatencyKey& b) {
+    friend bool operator<(const RouteKey& a, const RouteKey& b) {
       return std::tie(a.method, a.route) < std::tie(b.method, b.route);
     }
   };
 
-  // One histogram: per-bucket counts (parallel to buckets_, non-cumulative
-  // here and accumulated at exposition time) plus the sum and count the
-  // format also carries.
-  struct HistogramData {
-    std::vector<std::uint64_t> counts{};
-    // In whichever unit options_.latency_unit names.
-    double sum = 0.0;
-    std::uint64_t count = 0;
+  // Everything the four built-in per-route families report, in one record
+  // under one key.
+  //
+  // Deliberately not two maps. Counters were once keyed by {method,route,
+  // status} while the histogram was keyed by {method,route}, and since
+  // status is not exported the counter map held strictly more keys for the
+  // same traffic — so it reached the cap first, and past that point a new
+  // status on an already-seen route was refused by the counters while the
+  // histogram, whose key already existed, kept recording. requests_total
+  // silently stopped counting while _count went on rising. One key, one
+  // admission, one cap: the families cannot drift apart because there is
+  // nothing to drift.
+  //
+  // duration_count is separate from `requests` because a request rejected
+  // before any handler ran is counted and deliberately not timed; a route
+  // that only ever saw rejections has requests but no histogram at all.
+  struct RouteStats {
+    std::uint64_t requests = 0;
+    std::uint64_t success = 0;
+    std::uint64_t failure = 0;
+    // Per-bucket counts parallel to HttpLatencyBuckets(), non-cumulative
+    // here and accumulated at exposition time, in microseconds.
+    std::vector<std::uint64_t> buckets{};
+    double duration_sum = 0.0;
+    std::uint64_t duration_count = 0;
   };
 
   // Renders `{a="1",b="2"}` from the constant labels plus what is passed,
   // dropping any pair whose name is empty. Callers hold mutex_.
   std::string BuiltInLabels(const MetricLabels& labels) const;
 
+  // Finds or admits the stats for `key`, or returns nullptr when the cap
+  // refuses it (recording the refusal). Callers hold mutex_.
+  RouteStats* AdmitRoute(const RouteKey& key);
+
   MetricsOptions options_;
   mutable std::mutex mutex_;
-  std::map<CountKey, std::uint64_t> counts_;
-  std::map<LatencyKey, HistogramData> latencies_;
+  std::map<RouteKey, RouteStats> routes_;
   // Always keyed by method, whether or not the gauge is exposed that way:
   // the unlabeled form is the sum, and the key set is bounded by the method
   // vocabulary.

@@ -13,7 +13,9 @@
 
 #include <atomic>
 #include <chrono>
+#include <limits>
 #include <memory>
+#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -1180,6 +1182,159 @@ TEST(ExpositionContractTest, InventedMethodsCollapseOnTheGaugeToo) {
   for (const std::string token : {"FOOBAR1", "FOOBAR2", R"(http_method="get")"}) {
     EXPECT_EQ(exposition.find(token), std::string::npos) << exposition;
   }
+}
+
+// The name of the metric a sample line reports, or "" for a comment or a
+// blank. Everything before the '{' or the space, which is what the format
+// requires to be grouped.
+std::string SampleMetricName(const std::string& line) {
+  if (line.empty() || line.starts_with('#')) {
+    return "";
+  }
+  const std::size_t end = line.find_first_of("{ ");
+  return end == std::string::npos ? line : line.substr(0, end);
+}
+
+// The first metric name whose sample lines are split into two or more
+// blocks, or "" when every family is contiguous.
+std::string FirstSplitFamily(const std::string& exposition) {
+  std::vector<std::string> order;
+  std::istringstream stream(exposition);
+  for (std::string line; std::getline(stream, line);) {
+    const std::string name = SampleMetricName(line);
+    if (!name.empty() && (order.empty() || order.back() != name)) {
+      order.push_back(name);
+    }
+  }
+  std::set<std::string> seen;
+  for (const std::string& name : order) {
+    if (!seen.insert(name).second) {
+      return name;
+    }
+  }
+  return "";
+}
+
+TEST(ExpositionContractTest, EveryFamilyIsContiguous) {
+  // Prometheus 0.0.4 requires all lines of a metric to arrive as one group.
+  // The drop counter used to be emitted unlabeled, then the application
+  // families, then its own per-family attributions — splitting it in two,
+  // which a strict parser rejects and a lenient one silently mis-stores.
+  MetricsOptions options = Enabled();
+  options.max_series = 1;
+  MetricsRegistry registry(options);
+  registry.RecordStart(RequestStart{.method = "GET", .target = "/things"});
+  registry.Record(Served("GET", "GetThing", 200, microseconds(1000)));
+  registry.Record(Served("POST", "PutThing", 500, microseconds(1000)));  // over the cap
+
+  auto counter = registry.NewCounter("widgets_total", "Widgets.");
+  auto gauge = registry.NewGauge("queue_depth", "Pending.");
+  auto sizes = registry.NewHistogram("payload_bytes", "Payloads.", {10, 100});
+  counter.Increment();
+  gauge.Set(3);
+  sizes.Observe(42);
+  for (int i = 0; i < 5; ++i) {
+    counter.Increment({{"shard", std::to_string(i)}});  // over the cap, attributed
+  }
+
+  const std::string exposition = registry.Expose();
+  EXPECT_EQ(FirstSplitFamily(exposition), "") << exposition;
+  // And the attribution is still there, next to the unlabeled total.
+  EXPECT_TRUE(HasLine(exposition,
+                      R"(metrics_observations_dropped_total{service_name="todo-service",)"
+                      R"(metric="widgets_total"} 5)"))
+      << exposition;
+}
+
+TEST(ExpositionContractTest, HelpTextIsEscapedSoItCannotForgeALine) {
+  // HELP runs to the end of the line and an application family's help is a
+  // caller's string. A newline in it would end the HELP line early and let
+  // whatever follows pose as its own directive.
+  MetricsRegistry registry(Enabled());
+  auto counter = registry.NewCounter("widgets_total", "Widgets.\n# TYPE forged_total counter");
+  counter.Increment();
+
+  const std::string exposition = registry.Expose();
+  EXPECT_TRUE(HasLine(exposition, R"(# HELP widgets_total Widgets.\n# TYPE forged_total counter)"))
+      << exposition;
+  EXPECT_FALSE(HasLine(exposition, "# TYPE forged_total counter"))
+      << "a newline in help forged a TYPE line: " << exposition;
+
+  // A backslash is escaped too, or it would eat the character after it.
+  MetricsRegistry other(Enabled());
+  auto slashed = other.NewCounter("paths_total", R"(Paths like C:\temp.)");
+  slashed.Increment();
+  EXPECT_TRUE(HasLine(other.Expose(), R"(# HELP paths_total Paths like C:\\temp.)"))
+      << other.Expose();
+}
+
+TEST(MetricsRegistryTest, TheCapCannotSplitACountFromItsLatency) {
+  // The counters and the histogram share one key and one admission, so a
+  // route that is past the cap is refused from all four families at once.
+  // They were once keyed differently — counters by {method,route,status},
+  // the histogram by {method,route} — so the counter map filled first, and
+  // past that point a new status on an already-admitted route was refused
+  // by the counters while the histogram, whose key already existed, kept
+  // recording. requests_total silently stopped counting while _count rose.
+  MetricsOptions options = Enabled();
+  options.max_series = 2;
+  MetricsRegistry registry(options);
+  registry.Record(Served("GET", "GetThing", 200, microseconds(1000)));
+  registry.Record(Served("GET", "PutThing", 200, microseconds(1000)));  // cap now full
+
+  // A new status on an already-admitted route: same key, so it counts.
+  registry.Record(Served("GET", "GetThing", 500, microseconds(1000)));
+  // A genuinely new route: refused, and counted as refused.
+  registry.Record(Served("GET", "Unseen", 200, microseconds(1000)));
+
+  const std::string exposition = registry.Expose();
+  const std::string labels = R"(service_name="todo-service",http_method="GET",route="GetThing")";
+  EXPECT_TRUE(HasLine(exposition, "http_server_requests_total{" + labels + "} 2")) << exposition;
+  EXPECT_TRUE(HasLine(exposition, "http_server_requests_success_total{" + labels + "} 1"))
+      << exposition;
+  EXPECT_TRUE(HasLine(exposition, "http_server_requests_failure_total{" + labels + "} 1"))
+      << exposition;
+  // The number that used to drift: the histogram agrees with the counter.
+  EXPECT_TRUE(
+      HasLine(exposition, "http_server_request_duration_microseconds_count{" + labels + "} 2"))
+      << exposition;
+
+  EXPECT_EQ(exposition.find(R"(route="Unseen")"), std::string::npos) << exposition;
+  EXPECT_TRUE(
+      HasLine(exposition, R"(metrics_observations_dropped_total{service_name="todo-service"} 1)"))
+      << exposition;
+}
+
+TEST(MetricsRegistryTest, ARejectedRouteIsCountedWithoutInventingAHistogram) {
+  // Rejections share the unmatched route with 404s. The route is counted,
+  // and the histogram counts only the requests that were actually timed —
+  // an all-zero histogram would claim an observation nobody filed.
+  MetricsRegistry registry(Enabled());
+  registry.RecordRejection("PUT", 413);
+  registry.RecordRejection("PUT", 413);
+
+  const std::string exposition = registry.Expose();
+  const std::string labels = R"(service_name="todo-service",http_method="PUT",route="unmatched")";
+  EXPECT_TRUE(HasLine(exposition, "http_server_requests_total{" + labels + "} 2")) << exposition;
+  EXPECT_TRUE(HasLine(exposition, "http_server_requests_failure_total{" + labels + "} 2"))
+      << exposition;
+  EXPECT_EQ(exposition.find("http_server_request_duration_microseconds_count{" + labels),
+            std::string::npos)
+      << exposition;
+}
+
+TEST(MetricsRegistryDeathTest, AnUnusableHistogramLadderAborts) {
+  // The guide promises this, and the built-in ladder gets it for free by
+  // being a constant. An unsorted ladder yields cumulative buckets that
+  // disagree with themselves — plausible nonsense on a dashboard rather
+  // than a loud failure (ADR-0009).
+  EXPECT_DEATH({ MetricsRegistry(Enabled()).NewHistogram("a_bytes", "A.", {}); }, "");
+  const std::vector<double> descending = {100, 10};
+  EXPECT_DEATH({ MetricsRegistry(Enabled()).NewHistogram("b_bytes", "B.", descending); }, "");
+  const std::vector<double> repeated = {10, 10};
+  EXPECT_DEATH({ MetricsRegistry(Enabled()).NewHistogram("c_bytes", "C.", repeated); }, "");
+  const std::vector<double> infinite = {10, std::numeric_limits<double>::infinity()};
+  EXPECT_DEATH({ MetricsRegistry(Enabled()).NewHistogram("d_bytes", "D.", infinite); }, "");
 }
 
 }  // namespace

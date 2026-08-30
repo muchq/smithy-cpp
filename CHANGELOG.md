@@ -19,8 +19,9 @@ policy in [docs/versioning.md](docs/versioning.md).
   the logged ones; compose the endpoint outside the recorder and scrapes
   answer without inflating the request rate they report. Label cardinality is
   bounded by construction: `target` is never a label (path parameters and
-  query strings would mint a series per request id), an off-wire `method`
-  outside the standard set collapses to `other`, and a series cap backstops
+  query strings would mint a series per request id), an off-wire
+  `http_method` outside the nine RFC 9110 verbs collapses to `CUSTOM`, and a
+  series cap backstops
   anything unforeseen while counting what it refused in
   `metrics_observations_dropped_total`. Application metrics join the
   same scrape through `NewCounter` / `NewGauge` / `NewHistogram`, so one

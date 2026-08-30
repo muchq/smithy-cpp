@@ -159,12 +159,35 @@ void AppendSample(std::string& out, std::string_view name, std::string_view suff
   out += '\n';
 }
 
+// HELP runs to the end of the line, so a backslash or a newline in it
+// corrupts the scrape the same way an unescaped label value would — and for
+// an application family the help text is a caller's string. The format
+// escapes only these two here; a quote needs no escaping in HELP, unlike in
+// a label value.
+std::string EscapeHelp(std::string_view help) {
+  std::string escaped;
+  escaped.reserve(help.size());
+  for (const char c : help) {
+    switch (c) {
+      case '\\':
+        escaped += "\\\\";
+        break;
+      case '\n':
+        escaped += "\\n";
+        break;
+      default:
+        escaped += c;
+    }
+  }
+  return escaped;
+}
+
 void AppendFamilyHeader(std::string& out, std::string_view name, std::string_view type,
                         std::string_view help) {
   out += "# HELP ";
   out += name;
   out += ' ';
-  out += help;
+  out += EscapeHelp(help);
   out += "\n# TYPE ";
   out += name;
   out += ' ';
@@ -279,6 +302,23 @@ void MetricsRegistry::RecordStart(const RequestStart& start) {
   ++in_flight_[std::move(method)];
 }
 
+MetricsRegistry::RouteStats* MetricsRegistry::AdmitRoute(const RouteKey& key) {
+  if (auto found = routes_.find(key); found != routes_.end()) {
+    return &found->second;
+  }
+  if (routes_.size() >= options_.max_series) {
+    // The backstop for an unbounded route stamped by a hand-written handler.
+    // Counted once per refused observation, not once per family: the counter
+    // answers "how much traffic am I blind to", and one event is one gap.
+    ++observations_dropped_;
+    return nullptr;
+  }
+  return &routes_
+              .emplace(key, RouteStats{.buckets = std::vector<std::uint64_t>(
+                                           HttpLatencyBuckets().size(), 0)})
+              .first->second;
+}
+
 void MetricsRegistry::Record(const RequestObservation& observation) {
   if (!options_.enabled) {
     return;
@@ -286,55 +326,41 @@ void MetricsRegistry::Record(const RequestObservation& observation) {
   // The hook is already microseconds, which is the exposition's unit too, so
   // nothing is converted and nothing is rounded away.
   const auto duration = static_cast<double>(observation.duration.count());
-  const CountKey count_key{
-      .method = NormalizeMethod(observation.method),
-      .route = observation.operation.empty() ? std::string(kUnmatchedRoute) : observation.operation,
-      .status = observation.status};
-  const LatencyKey latency_key{.method = count_key.method, .route = count_key.route};
+  const RouteKey key{.method = NormalizeMethod(observation.method),
+                     .route = observation.operation.empty() ? std::string(kUnmatchedRoute)
+                                                            : observation.operation};
 
   const std::lock_guard<std::mutex> lock(mutex_);
-  // Only decrement a gauge that was incremented: without RecordStart wired up
-  // the gauge stays at zero rather than counting downward forever.
-  if (auto in_flight = in_flight_.find(count_key.method);
+  // Before the cap check: a request that started must bring the gauge back
+  // down whether or not its route survives admission, or a refused route
+  // leaks in-flight forever. Only decrement one that was incremented —
+  // without RecordStart wired up the gauge stays at zero rather than
+  // counting downward.
+  if (auto in_flight = in_flight_.find(key.method);
       in_flight != in_flight_.end() && in_flight->second > 0) {
     --in_flight->second;
   }
 
-  // One observation refused is one increment, whichever family had to turn
-  // it away — the counter answers "how much traffic am I blind to", so
-  // counting it once per family would overstate the gap.
-  bool dropped = false;
-  if (auto found = counts_.find(count_key); found != counts_.end()) {
-    ++found->second;
-  } else if (counts_.size() < options_.max_series) {
-    counts_.emplace(count_key, 1);
-  } else {
-    dropped = true;
+  RouteStats* stats = AdmitRoute(key);
+  if (stats == nullptr) {
+    return;
   }
-
-  auto latency = latencies_.find(latency_key);
-  if (latency == latencies_.end() && latencies_.size() >= options_.max_series) {
-    dropped = true;
+  ++stats->requests;
+  // The 400 boundary is the one the rest of the fleet already draws:
+  // 2xx-3xx succeeded, 4xx and 5xx did not.
+  if (observation.status < 400) {
+    ++stats->success;
   } else {
-    if (latency == latencies_.end()) {
-      latency = latencies_
-                    .emplace(latency_key, HistogramData{.counts = std::vector<std::uint64_t>(
-                                                            HttpLatencyBuckets().size(), 0)})
-                    .first;
-    }
-    HistogramData& histogram = latency->second;
-    histogram.sum += duration;
-    ++histogram.count;
-    // The first bucket at or above the value; a value past the last one
-    // lands only in +Inf, which the exposition takes from `count`. Buckets
-    // are upper-inclusive, which is what `le` means.
-    const auto bucket = std::ranges::lower_bound(HttpLatencyBuckets(), duration);
-    if (bucket != HttpLatencyBuckets().end()) {
-      ++histogram.counts[static_cast<std::size_t>(bucket - HttpLatencyBuckets().begin())];
-    }
+    ++stats->failure;
   }
-  if (dropped) {
-    ++observations_dropped_;
+  stats->duration_sum += duration;
+  ++stats->duration_count;
+  // The first bucket at or above the value; a value past the last one lands
+  // only in +Inf, which the exposition takes from the count. Buckets are
+  // upper-inclusive, which is what `le` means.
+  const auto bucket = std::ranges::lower_bound(HttpLatencyBuckets(), duration);
+  if (bucket != HttpLatencyBuckets().end()) {
+    ++stats->buckets[static_cast<std::size_t>(bucket - HttpLatencyBuckets().begin())];
   }
 }
 
@@ -346,17 +372,24 @@ void MetricsRegistry::RecordRejection(std::string_view method, int status) {
   // before the method token was ever read, and that is a different diagnosis
   // from a client inventing a verb. Both are constants, which is what the
   // label set needs.
-  const CountKey key{
+  const RouteKey key{
       .method = method.empty() ? std::string(kUnparsedMethod) : NormalizeMethod(method),
-      .route = std::string(kUnmatchedRoute),
-      .status = status};
+      .route = std::string(kUnmatchedRoute)};
+
   const std::lock_guard<std::mutex> lock(mutex_);
-  if (auto found = counts_.find(key); found != counts_.end()) {
-    ++found->second;
-  } else if (counts_.size() < options_.max_series) {
-    counts_.emplace(key, 1);
+  RouteStats* stats = AdmitRoute(key);
+  if (stats == nullptr) {
+    return;
+  }
+  // Counted, and deliberately not timed: a request refused at parse time has
+  // no service latency to report, and filing it as a zero observation would
+  // drag rate(_sum)/rate(_count) toward zero — flattering the latency panel
+  // during exactly the flood it should be exposing.
+  ++stats->requests;
+  if (status < 400) {
+    ++stats->success;
   } else {
-    ++observations_dropped_;
+    ++stats->failure;
   }
 }
 
@@ -418,6 +451,24 @@ Gauge MetricsRegistry::NewGauge(std::string name, std::string help) {
 
 Histogram MetricsRegistry::NewHistogram(std::string name, std::string help,
                                         std::vector<double> buckets) {
+  // The same fail-fast the built-in ladder gets by being a constant. An
+  // unsorted or non-finite ladder does not fail loudly at scrape time; it
+  // silently produces cumulative buckets that disagree with themselves,
+  // which a dashboard renders as plausible nonsense (ADR-0009).
+  if (buckets.empty()) {
+    smithy::internal::Fatal("smithy::server::MetricsRegistry: histogram '" + name +
+                            "' needs at least one bucket (the +Inf bucket is implicit)");
+  }
+  for (std::size_t i = 0; i < buckets.size(); ++i) {
+    if (!std::isfinite(buckets[i])) {
+      smithy::internal::Fatal("smithy::server::MetricsRegistry: histogram '" + name +
+                              "' buckets must all be finite (the +Inf bucket is implicit)");
+    }
+    if (i > 0 && buckets[i] <= buckets[i - 1]) {
+      smithy::internal::Fatal("smithy::server::MetricsRegistry: histogram '" + name +
+                              "' buckets must be strictly ascending");
+    }
+  }
   auto family = Register(std::move(name), std::move(help), internal::MetricFamily::Kind::kHistogram,
                          std::move(buckets));
   return Histogram(options_.enabled ? std::move(family) : nullptr);
@@ -432,53 +483,39 @@ std::string MetricsRegistry::Expose() const {
   std::string out;
   const std::lock_guard<std::mutex> lock(mutex_);
 
-  // Families are emitted whole and in order — std::map keeps every series of
-  // a family contiguous, which the format requires. Headers print even with
-  // no samples yet, so a freshly started server still describes its shape.
-  //
-  // The three request counters are views of one tally rather than three
-  // tallies: success and failure are derived from the same status-keyed
-  // counts the total sums, so they cannot disagree with it or with each
-  // other, and they need no drop accounting of their own.
-  struct Outcome {
-    std::uint64_t total = 0;
-    std::uint64_t success = 0;
-    std::uint64_t failure = 0;
-  };
-  std::map<LatencyKey, Outcome> by_route;
-  for (const auto& [key, value] : counts_) {
-    Outcome& outcome = by_route[LatencyKey{.method = key.method, .route = key.route}];
-    outcome.total += value;
-    // The 400 boundary is the one the rest of the fleet already draws:
-    // 2xx-3xx succeeded, 4xx and 5xx did not.
-    if (key.status < 400) {
-      outcome.success += value;
-    } else {
-      outcome.failure += value;
-    }
-  }
-  const auto route_labels = [this](const LatencyKey& key) {
+  // Families are emitted whole and in order. The format requires every line
+  // of a family to be contiguous, so each family is written in one pass —
+  // including the drop counter below, whose per-family samples used to trail
+  // the application families and split it in two.
+  const auto route_labels = [this](const RouteKey& key) {
     return BuiltInLabels(
         {{std::string(kMethodLabel), key.method}, {std::string(kRouteLabel), key.route}});
   };
   const auto counter_family = [&](std::string_view name, std::string_view help,
-                                  std::uint64_t Outcome::*field) {
+                                  std::uint64_t RouteStats::*field) {
     AppendFamilyHeader(out, name, "counter", help);
-    for (const auto& [key, outcome] : by_route) {
-      AppendSample(out, name, "", route_labels(key), std::to_string(outcome.*field));
+    for (const auto& [key, stats] : routes_) {
+      AppendSample(out, name, "", route_labels(key), std::to_string(stats.*field));
     }
   };
-  counter_family(kRequestsTotal, kRequestsTotalHelp, &Outcome::total);
-  counter_family(kRequestsSuccess, kRequestsSuccessHelp, &Outcome::success);
-  counter_family(kRequestsFailure, kRequestsFailureHelp, &Outcome::failure);
+  // Three views of one tally, read off one record, so they cannot disagree.
+  counter_family(kRequestsTotal, kRequestsTotalHelp, &RouteStats::requests);
+  counter_family(kRequestsSuccess, kRequestsSuccessHelp, &RouteStats::success);
+  counter_family(kRequestsFailure, kRequestsFailureHelp, &RouteStats::failure);
 
   AppendFamilyHeader(out, kRequestDuration, "histogram", kRequestDurationHelp);
-  for (const auto& [key, histogram] : latencies_) {
+  for (const auto& [key, stats] : routes_) {
+    // A route that was only ever rejected has requests but nothing timed.
+    // Emitting an all-zero histogram for it would claim an observation that
+    // was deliberately not filed.
+    if (stats.duration_count == 0) {
+      continue;
+    }
     const std::string labels = route_labels(key);
     const std::string prefix = labels + ",";
     std::uint64_t cumulative = 0;
     for (std::size_t i = 0; i < HttpLatencyBuckets().size(); ++i) {
-      cumulative += histogram.counts[i];
+      cumulative += stats.buckets[i];
       AppendSample(out, kRequestDuration, "_bucket",
                    prefix + "le=\"" + FormatNumber(HttpLatencyBuckets()[i]) + "\"",
                    std::to_string(cumulative));
@@ -486,9 +523,9 @@ std::string MetricsRegistry::Expose() const {
     // +Inf is the total by definition, which also covers values past the
     // last finite bucket.
     AppendSample(out, kRequestDuration, "_bucket", prefix + "le=\"+Inf\"",
-                 std::to_string(histogram.count));
-    AppendSample(out, kRequestDuration, "_sum", labels, FormatNumber(histogram.sum));
-    AppendSample(out, kRequestDuration, "_count", labels, std::to_string(histogram.count));
+                 std::to_string(stats.duration_count));
+    AppendSample(out, kRequestDuration, "_sum", labels, FormatNumber(stats.duration_sum));
+    AppendSample(out, kRequestDuration, "_count", labels, std::to_string(stats.duration_count));
   }
 
   // No route label, and no zero baseline: the gauge moves at request start,
@@ -500,14 +537,24 @@ std::string MetricsRegistry::Expose() const {
                  std::to_string(count));
   }
 
+  // The drop counter, whole: the unlabeled total and every per-family
+  // attribution under one header. `dropped` rides on the family's own line
+  // rather than only the built-in counter, so a runaway label on one
+  // application metric is attributable to it.
   AppendFamilyHeader(out, kObservationsDropped, "counter", kObservationsDroppedHelp);
   AppendSample(out, kObservationsDropped, "", BuiltInLabels({}),
                std::to_string(observations_dropped_));
+  for (const auto& [name, family] : families_) {
+    const std::lock_guard<std::mutex> family_lock(family->mutex);
+    if (family->dropped != 0) {
+      AppendSample(out, kObservationsDropped, "", BuiltInLabels({{"metric", name}}),
+                   std::to_string(family->dropped));
+    }
+  }
+
   // Application families last, each whole and in name order; their samples
   // are already keyed by rendered labels, so a family's series are
-  // contiguous the way the format requires. `dropped` rides on the family's
-  // own line rather than the built-in counter, so a runaway label on one
-  // application metric is attributable to it.
+  // contiguous the way the format requires.
   for (const auto& [name, family] : families_) {
     const std::lock_guard<std::mutex> family_lock(family->mutex);
     const char* type = "counter";
@@ -535,10 +582,6 @@ std::string MetricsRegistry::Expose() const {
       AppendSample(out, name, "_bucket", bucket_labels, std::to_string(sample.count));
       AppendSample(out, name, "_sum", labels, FormatNumber(sample.value));
       AppendSample(out, name, "_count", labels, std::to_string(sample.count));
-    }
-    if (family->dropped != 0) {
-      AppendSample(out, kObservationsDropped, "", BuiltInLabels({{"metric", name}}),
-                   std::to_string(family->dropped));
     }
   }
   return out;

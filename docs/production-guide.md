@@ -397,7 +397,7 @@ zero dependencies. Two middleware compose around the generated handler:
 
 ```cpp
 auto metrics = std::make_shared<smithy::server::MetricsRegistry>(
-    smithy::server::MetricsOptions{.enabled = true});
+    smithy::server::MetricsOptions{.enabled = true, .service_name = "todo-service"});
 transport.Start(smithy::server::Chain({smithy::server::MetricsEndpoint(metrics),
                                        smithy::server::RecordMetrics(metrics)},
                                       server.Handler()));
@@ -547,13 +547,15 @@ sees them and an over-limit flood would be invisible in the counters:
 options.on_rejected = smithy::server::RecordRejections(metrics);
 ```
 
-These count as requests (`operation=""`, with `413`/`431` as the signature)
-but file no latency and never move the in-flight gauge: a request refused at
-parse time has no service latency to report, and recording it as a zero
-observation would drag `rate(_sum)/rate(_count)` down — flattering the
-latency panel during exactly the flood it should be exposing. A method that
-never parsed (a 431 can fire mid-headers) is labeled `unparsed` rather than
-`other`, since "never parsed" and "client invented a verb" are different
+These count as requests (`route="unmatched"`, with `413`/`431` as the
+signature) but file no latency and never move the in-flight gauge: a request
+refused at parse time has no service latency to report, and recording it as a
+zero observation would drag `rate(_sum)/rate(_count)` down — flattering the
+latency panel during exactly the flood it should be exposing. Because they
+are counted and not timed, a route that only ever saw rejections appears in
+the request counters with no histogram series at all. A method that never
+parsed (a 431 can fire mid-headers) is labeled `(unparsed)` rather than
+`CUSTOM`, since "never parsed" and "client invented a verb" are different
 diagnoses.
 
 The endpoint is unauthenticated: it is middleware, so gate it the way you

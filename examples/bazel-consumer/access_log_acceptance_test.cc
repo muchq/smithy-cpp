@@ -117,12 +117,19 @@ class ThrowingOnDemandHandler final : public TodoHandler {
 
 class AccessLogAcceptanceTest : public ::testing::Test {
  protected:
-  void SetUp() override {
+  void SetUp() override { Start(/*observe_trusts_the_proxy=*/true); }
+
+  // The limiter always gets the real trust boundary. `Observe` gets it only
+  // when asked — the negative control below starts a server without it, which
+  // is the wiring the production guide's snippet used to teach.
+  void Start(bool observe_trusts_the_proxy) {
     // The loopback peer is 127.0.0.1, so trusting it makes this connection
     // look like one arriving through a proxy — the topology the derivation
     // exists for.
     auto trusted = smithy::http::TrustedProxies::Parse({"127.0.0.0/8"});
     ASSERT_TRUE(trusted.ok()) << trusted.error().message();
+    const smithy::http::TrustedProxies observe_trust =
+        observe_trusts_the_proxy ? *trusted : smithy::http::TrustedProxies::None();
 
     log_ = std::make_shared<AccessLog>();
     limiter_ = std::make_shared<RecordingLimiter>(kBudget);
@@ -139,7 +146,7 @@ class AccessLogAcceptanceTest : public ::testing::Test {
                  // client it was rejected for.
                  smithy::server::Observe(
                      [log](const smithy::server::RequestObservation& o) { log->Write(o); }, nullptr,
-                     nullptr, *trusted),
+                     nullptr, observe_trust),
                  smithy::server::PerClientRateLimit(
                      [limiter](const std::string& client) { return limiter->Allow(client); },
                      *trusted, std::chrono::seconds(1))},
@@ -247,6 +254,45 @@ TEST_F(AccessLogAcceptanceTest, AThrownHandlerIsLoggedAsThrownThroughBeastContai
   // And the client is still there: a 500 is exactly when you want to know
   // who was calling.
   EXPECT_EQ(lines[0].client, kForwardedClient);
+}
+
+// The negative control for TheLoggedClientIsTheBucketTheLimiterKeyedOn.
+//
+// A passing test only means something if it can fail, and the way this one
+// fails is a wiring mistake rather than a code change — so the mistake is
+// wired up here and its symptom asserted, instead of being a claim in a
+// commit message that has to be re-verified by hand.
+//
+// This is exactly what the production guide's chain used to teach: the trust
+// boundary handed to `PerClientRateLimit` and not to `Observe`.
+class MisconfiguredAccessLogTest : public AccessLogAcceptanceTest {
+ protected:
+  void SetUp() override { Start(/*observe_trusts_the_proxy=*/false); }
+};
+
+TEST_F(MisconfiguredAccessLogTest, ObserveWithoutTheTrustBoundaryLogsTheProxy) {
+  const auto served = SendForwarded(R"({"title":"ship it"})");
+  ASSERT_TRUE(served.ok()) << served.error().message();
+  ASSERT_EQ(served->status, 200);
+
+  const auto lines = log_->lines();
+  ASSERT_EQ(lines.size(), 1u);
+  const auto keys = limiter_->keys();
+  ASSERT_EQ(keys.size(), 1u);
+
+  // The symptom: the log names the proxy, the limiter keyed on the client,
+  // and nothing anywhere reports an error. Both numbers look plausible on
+  // their own — which is why the positive test compares them to each other
+  // rather than to literals.
+  EXPECT_EQ(lines[0].client, "127.0.0.1");
+  EXPECT_EQ(keys[0], kForwardedClient);
+  EXPECT_NE(lines[0].client, keys[0])
+      << "the misconfiguration stopped being observable, so the positive test "
+         "can no longer fail and has stopped proving anything";
+  // TrustedProxies::None() is the deliberate direct-connect statement, so the
+  // peer IS the client and the header is ignored wholly — correct behavior
+  // for that configuration, and the wrong configuration for this deployment.
+  EXPECT_EQ(lines[0].client_source, smithy::http::DerivedClient::Source::kUntrustedHeaderIgnored);
 }
 
 }  // namespace

@@ -6,8 +6,92 @@ policy in [docs/versioning.md](docs/versioning.md).
 
 ## [Unreleased]
 
+### Added
+
+- **A dependency-free Prometheus `/metrics` endpoint** (#91, first work
+  item). `smithy::server::MetricsRegistry` aggregates the existing `Observe`
+  hooks into three families —
+  the five `http_server_*` families labeled by `service_name`, `http_method`
+  and `route` — and `MetricsEndpoint` serves them in the
+  text exposition format, which needs no client library and so costs zero new
+  dependencies. `RecordMetrics` is `Observe` wired to a registry, so request
+  timing keeps one implementation and the scraped numbers cannot drift from
+  the logged ones; compose the endpoint outside the recorder and scrapes
+  answer without inflating the request rate they report. Label cardinality is
+  bounded by construction: `target` is never a label (path parameters and
+  query strings would mint a series per request id), an off-wire
+  `http_method` outside the nine RFC 9110 verbs collapses to `CUSTOM`, and a
+  series cap backstops
+  anything unforeseen while counting what it refused in
+  `metrics_observations_dropped_total`. Application metrics join the
+  same scrape through `NewCounter` / `NewGauge` / `NewHistogram`, so one
+  Prometheus target covers the service; the registry keeps owning escaping,
+  label ordering, and the per-family cap. `Declare` exports a known series at
+  zero from startup, so the first event is a visible step rather than a
+  counter's invisible first sample. `RecordRejections` feeds
+  `BeastServerTransport::Options::on_rejected`, so the 413/431 the transport
+  writes before any middleware exists are counted too — without filing a
+  zero latency that would flatter the panel during an over-limit flood.
+
+  The whole stack is **off unless `MetricsOptions::enabled` says otherwise**,
+  and off means absent rather than idle: `RecordMetrics` and `MetricsEndpoint`
+  compose to the identity, so a disabled registry puts no wrapper on the
+  request path and `/metrics` 404s through to the router rather than serving
+  an empty scrape that would read as a live target with nothing to report.
+  Handles from a disabled registry are inert rather than unusable, so
+  application code never branches on the flag. Registration is deliberately
+  *not* conditional on it — an invalid name, a type collision, or a bad bucket
+  ladder aborts at startup either way, so enabling metrics in production is
+  never the first time those checks run.
+
+  The exposition is [MoonBase](https://github.com/muchq/MoonBase)'s shared
+  HTTP serving contract, and is deliberately not configurable: the five
+  `http_server_*` families with the descriptions its three emitter rails pin,
+  the `service_name`/`http_method`/`route` label set, the `unmatched` and
+  `/health` route sentinels, the `CUSTOM` and `(unparsed)` method sentinels,
+  and the microsecond bucket ladder `//domains/platform/libs/otel_contract`
+  pins equal across them. Those services are who scrapes this, so a service
+  here can replace an aura/futility, yodel, or server_pal one without touching
+  a dashboard — and a knob would only be a way to drift off the contract
+  silently, since the failure renders as an empty panel rather than an error.
+  `service_name` is required when enabled and an empty one aborts, because
+  every dashboard query selects on it. Status is not a label: the success and
+  failure counters carry the outcome and are derived from the same tally the
+  total sums, so the three cannot disagree. The active gauge carries no route,
+  which is where every rail leaves it — it moves before dispatch. See the
+  Observability section of
+  [docs/production-guide.md](docs/production-guide.md).
+
+- **`RequestObservation` carries what an access log needs** (#202).
+  `Observe` reported six fields, which was enough for metrics and not for the
+  other thing every server does with a per-request hook. MoonBase's aura says
+  so in its own comment: its access log is *kept separate from `Observe`*
+  because the observation lacks the response size and the forwarded client,
+  so the chain runs two clocks per request measuring the same interval. Worse,
+  the raw `x-forwarded-for` it logs instead is not the ADR-0012 derived client
+  `PerClientRateLimit` keys on, so "whose bucket did that 429 come from" was
+  unanswerable. The observation now adds `request_bytes`, `response_bytes`,
+  `handler_threw`, and `client` — the derived client with its provenance,
+  never the forgeable header. `Observe` takes the trust boundary as a fourth
+  defaulted parameter (`TrustedProxies::None()`, the direct-connect
+  statement); pass it the same one given to the limiter. `handler_threw`
+  separates a contained crash from a deliberate 500, which report identically
+  otherwise.
+
 ### Fixed
 
+- **Health probes are distinguishable from dispatch failures in observability
+  hooks.** `HealthEndpoint` built its response without stamping
+  `HttpResponse::operation`, so every probe reached `Observe` (and so any
+  metrics or logging backend) as the empty operation — the same value
+  404/405/400 use. Since Kubernetes polls a probe every few seconds, that is
+  usually the highest-volume path a service has, and merging the two meant
+  the 404 rate could not be read, the probe's own latency contaminated the
+  service's duration histogram, and no filter could separate them.
+  `HealthEndpoint` and `MetricsEndpoint` now report their own configured path
+  as the operation (`/livez`, `/readyz`, `/metrics`), which is fixed at
+  composition and so adds one series per composed endpoint. Chains that do
+  not observe probe traffic are unaffected.
 - **Numeric wire values no longer truncate into generated narrow types**
   (#109). Three holes in the otherwise-uniform range-check posture: an
   `intEnum` member in a document body cast the raw wire int64 straight into

@@ -203,17 +203,26 @@ transport.Start(smithy::server::Chain(
      smithy::server::PerClientRateLimit(
          [limiter](const std::string& client) { return limiter->Allow(client); },
          trusted, std::chrono::seconds(30)),
-     // Observe everything admitted — health probes included. on_start
-     // (optional) enables an in-flight gauge; on_complete carries
-     // method/target/operation/status/duration/trace_parent.
+     // Observe everything admitted — health probes included, reporting
+     // `operation` as their own path so a dashboard can filter them out.
+     // Hand it the SAME trust boundary as the limiter: without it the
+     // observation reports the peer while the limiter keyed on the
+     // forwarded client, and the log cannot answer a question about the
+     // limiter's own decision.
      smithy::server::Observe(
          [](const smithy::server::RequestObservation& o) {
-           // gauge -1; count 1; latency o.duration — feed any backend.
+           // One access-log record: o.method, o.target, o.operation,
+           // o.status, o.duration, o.trace_parent, o.request_bytes,
+           // o.response_bytes, o.handler_threw (a contained crash, not a
+           // deliberate 500), and o.client — the derived client with its
+           // .source provenance, which is the bucket the limiter keyed on.
+           // Also gauge -1; count 1; latency o.duration.
          },
          [](const smithy::server::RequestStart& s) {
            // gauge +1 (labeled by s.method/s.target; the operation is not
            // known until the router runs).
-         }),
+         },
+         nullptr, trusted),
      // Liveness: GET or HEAD /livez -> 200 {"status":"healthy"}. A HEAD
      // gets that body's Content-Length and none of its octets, framed by
      // the transport; everything else passes through to the router.
@@ -229,7 +238,9 @@ transport.Start(smithy::server::Chain(
 
 The first middleware in the chain is outermost: it sees the request first and
 can short-circuit before anything below it runs (so the limiter's rejections
-never reach `Observe` — track rejection rates in the limiter itself). Because
+never reach `Observe` — track rejection rates in the limiter itself, or
+compose `Observe` *outside* the limiter, which logs the 429s with the client
+they were rejected for at the cost of observing traffic you refused). Because
 admission keys on the derived client address, health probes budget as their
 real source (the node or balancer address the transport saw) rather than
 sharing one spoofable key with abusive traffic; if even that source's own
@@ -260,12 +271,11 @@ address changed; the CIDR didn't) fails silently: the spoof defense ignores
 the header on every request and all traffic collapses onto the proxy's one
 key. The fingerprint is visible in `smithy::http::DeriveClient` — the
 richer form of `ClientAddress` that also reports *how* the address was
-derived. Count its `source` where the request is still in hand — a
-one-line middleware wrapping the chain above; `Observe`'s sink sees only
-the finished observation, not the request. On the dashboard: behind a
-proxy, ~100% `kUntrustedHeaderIgnored` means the trust set no longer
-matches the topology, and ~100% `kTrustedTier` means the proxy is not
-appending `x-forwarded-for`.
+derived. `Observe` reports it directly — `o.client.source`, derived against
+the `TrustedProxies` you passed it — so counting it needs no extra
+middleware. On the dashboard: behind a proxy, ~100% `kUntrustedHeaderIgnored`
+means the trust set no longer matches the topology, and ~100% `kTrustedTier`
+means the proxy is not appending `x-forwarded-for`.
 
 **Plumbing the trust set.** The boundary is deployment config; the
 convention is a `TRUSTED_PROXY_CIDRS` environment variable holding a
@@ -339,7 +349,8 @@ OpenTelemetry — plugs in without the core taking a telemetry dependency.
 
 **Server:** `Observe` (above) reports, per request: `method`, `target`,
 `operation` (the Smithy operation that handled it, stamped by the generated
-router; empty for 404/405/400 dispatch failures), `status`, `duration`, and
+router; the endpoint's own path for `HealthEndpoint` and `MetricsEndpoint`;
+empty for 404/405/400 dispatch failures), `status`, `duration`, and
 `trace_parent` — the request's W3C `traceparent` header, which always parses:
 a valid inbound one continues verbatim, and the transport ingress mints a
 fresh root when the client sent none or sent garbage (ADR-0011). The same
@@ -347,6 +358,25 @@ trace id is the `x-correlation-id` on the contained 500 when a handler
 throws. An optional `on_start` callback fires before dispatch (method and
 target only), enabling in-flight gauges; start/complete always pair, even
 when the handler throws.
+
+It also reports `request_bytes` and `response_bytes`, a `handler_threw` flag,
+and `client` — the ADR-0012 derived client (address plus provenance), **not**
+the raw `x-forwarded-for`, which a direct client can forge. That is the
+identity `PerClientRateLimit` keys on, so it is the one that answers "whose
+bucket did that 429 come from"; pass `Observe` the same `TrustedProxies` you
+give the limiter or the two will disagree. Unset means
+`TrustedProxies::None()` — the deliberate direct-connect statement, under
+which the peer is the client and the header is ignored wholly. Watch the
+distribution of `client.source`: every request reporting `kDirectPeer` with
+one address means you are behind a proxy and did not say so.
+
+`handler_threw` separates "we crashed" from "the handler deliberately
+answered 500" — both report status 500 with no operation, and an access log
+that cannot tell them apart sends whoever reads a 5xx spike looking for the
+wrong thing. A thrown request has no response, so its `response_bytes` is 0;
+`handler_threw` is what makes that an absence rather than an empty body. The
+exception text stays on the transport's containment log, which carries the
+same trace id.
 
 **Client:** two ready-made interceptors in
 `smithy/client/observability.h`:
@@ -369,6 +399,177 @@ config.interceptors.push_back(smithy::PropagateTraceContext());
 `ParseTraceparent`, `FormatTraceparent`, `GenerateTraceContext`,
 `GenerateSpanId` — for building richer integrations (e.g. a server
 middleware that opens a span from `RequestObservation::trace_parent`).
+
+**Prometheus:** the one bundled backend, because the text exposition format
+needs no client library — it is a few lines of text over HTTP, so it costs
+zero dependencies. Two middleware compose around the generated handler:
+
+```cpp
+auto metrics = std::make_shared<smithy::server::MetricsRegistry>(
+    smithy::server::MetricsOptions{.enabled = true, .service_name = "todo-service"});
+transport.Start(smithy::server::Chain({smithy::server::MetricsEndpoint(metrics),
+                                       smithy::server::RecordMetrics(metrics)},
+                                      server.Handler()));
+```
+
+**It is off unless you say otherwise.** `MetricsOptions::enabled` defaults to
+false, and a disabled registry is not a registry that records into a void: the
+two middleware compose to the *identity*, so nothing wraps the request path —
+no timing, no lock, not even an extra call frame — and `/metrics` reaches the
+router like any other unmodeled path and 404s. (A disabled endpoint answering
+an empty 200 would read to Prometheus as a live target reporting no series,
+which is exactly what a service whose metrics have gone silent looks like.)
+Handles from a disabled registry are inert rather than unusable, so
+application code never branches on the flag; only their *arguments* still
+cost anything, so guard a hot call site whose labels are themselves expensive
+with `metrics->enabled()`.
+
+Registration is not conditional on the flag. An invalid metric name, a type
+collision, or a bad bucket ladder aborts at startup either way (ADR-0009), so
+switching metrics on in production is never the first time those checks run.
+
+`RecordMetrics` is `Observe` wired to the registry, so request timing has one
+implementation and the scraped numbers cannot drift from the logged ones. The
+order above is deliberate: the endpoint sits *outside* the recorder, so
+scrapes answer without being counted as served traffic — swap them and every
+scrape inflates your own request rate, at whatever interval Prometheus polls.
+
+Five families are exposed on `/metrics` (path configurable), labeled by
+`service_name`, `http_method` and `route`:
+
+| Family | Type | Notes |
+| --- | --- | --- |
+| `http_server_requests_total` | counter | every completed request |
+| `http_server_requests_success_total` | counter | status < 400 |
+| `http_server_requests_failure_total` | counter | status >= 400 |
+| `http_server_requests_active_gauge` | gauge | no `route` label; see below |
+| `http_server_request_duration_microseconds` | histogram | `_bucket`/`_sum`/`_count` |
+
+plus `metrics_observations_dropped_total`, the registry's own health.
+
+This is not a vocabulary of our own invention, and it is deliberately **not
+configurable**. It is [MoonBase](https://github.com/muchq/MoonBase)'s shared
+HTTP serving contract — spoken identically by its Java (yodel), Rust
+(server_pal) and C++ (futility/otel, behind aura) emitters, and pinned across
+them by `//domains/platform/libs/otel_contract`: names, descriptions, label
+sets, route sentinels and bucket boundaries alike. Those services are who
+scrapes this, and their dashboards (prom_proxy) query exactly these names with
+exactly these labels. A knob here would be a way for one service to drift off
+that contract, and the drift is silent — the panel renders empty, which looks
+like a quiet service rather than a misconfigured one. If a second fleet ever
+needs a different dialect, that is the point to design one.
+
+`service_name` is required whenever metrics are enabled, and an empty one
+aborts at construction: every dashboard query selects on it, so a service
+reporting the empty string is scraped, stored, and invisible.
+
+Three consequences of the contract worth knowing:
+
+- **Status is not a label.** The outcome rides on the success and failure
+  counters, which are two views of the same tally the total sums — so the
+  three can never disagree, and no series is multiplied by the codes a
+  service happens to return.
+- **The active gauge carries no route.** It moves at request start, before
+  dispatch, where nothing bounded is known about the path. Every rail leaves
+  the route off it for that reason, and prom_proxy's negative
+  `route!="/health"` matcher passes a series without the label through
+  untouched — which is what makes the same filter safe on it.
+- **Durations are microseconds**, on the ladder the rails pin equal.
+  `histogram_quantile` reads `le` off bucket counts, so a service on a
+  different ladder charts a quantile computed against different bins than
+  everything beside it.
+
+The label set is bounded by construction, because cardinality is what
+actually kills a metrics endpoint. `target` is deliberately *not* a label —
+it carries path parameters and query strings, so one series per distinct URL
+is one series per request id; `route` is the bounded stand-in the router
+stamps from the model, and a request that reached no operation reports the
+`unmatched` sentinel rather than the empty string (`route!="/health"` matches
+the empty string, so unrouted traffic would silently join the serving
+figures). `HealthEndpoint` and `MetricsEndpoint` answer paths the model does
+not define, so they stamp that path as their route (`route="/health"`):
+probes are usually a service's highest-volume route, and left unlabeled they
+would bury the 404 rate in the sentinel they share with it, and mix their own
+latency into the same duration histogram. The path is fixed at composition,
+so it is one series per composed endpoint — compose the probes inside
+`RecordMetrics` if you want them counted, outside it if you do not.
+`http_method` arrives from the wire, so anything outside the nine RFC 9110
+verbs collapses to `CUSTOM` rather than minting a series per invented verb,
+and a request rejected before its method parsed reports `(unparsed)`. Past
+`max_series` combinations the registry stops minting and counts what it
+refused in `metrics_observations_dropped_total` — alert on that being
+non-zero rather than discovering the cap as an OOM.
+
+Two things composition still has to get right for the MoonBase dashboards:
+compose `HealthEndpoint()` on its default `/health` path and *inside*
+`RecordMetrics`, because prom_proxy subtracts `route!="/health"` from every
+serving number and charts that route on its own tile — a service that never
+reports it reads as having no probe rather than as a healthy one. And point
+Prometheus at the service directly: this produces the collector's output
+shape without the collector.
+
+Your own metrics share the same scrape — one Prometheus target covers the
+service, rather than the built-in families sitting behind one endpoint and
+your domain numbers behind another. Mint a family once and keep the handle:
+
+```cpp
+auto orders = metrics->NewCounter("orders_processed_total", "Orders processed.");
+auto latency = metrics->NewHistogram("order_pipeline_seconds", "Pipeline time.");
+auto depth = metrics->NewGauge("queue_depth", "Pending jobs.");
+
+orders.Increment({{"region", "us-east"}});
+latency.Observe(elapsed.count());
+depth.Set(pending);
+```
+
+Declare the series whose labels are known at startup — `orders.Declare({{"region",
+"us-east"}})`, or `depth.Declare()` for an unlabeled one. A series nobody has
+touched is simply absent from the scrape, and a counter whose first exported
+sample is its first event's value hides that event for good: `increase()` and
+`rate()` measure the change *between* samples, so with nothing earlier the
+first one shows no increase at all and the panel reads zero — worse than a
+missing tile, because it looks like an answer. Declaring is idempotent and
+never disturbs a series that already has events. A declared histogram is
+genuinely empty rather than an observation of zero, so `rate(_sum)/rate(_count)`
+stays unbiased. Labels carrying request data have no series to declare (and
+are the cardinality problem above); bound them to a known kind and declare
+that instead.
+
+Handles are cheap to copy and address the same family, so a handler can hold
+them as members. The registry keeps owning the parts that are easy to get
+wrong: label values are escaped, labels are sorted so `{a,b}` and `{b,a}` are
+one series rather than two, and the same per-family cap applies — a label
+taken from unbounded data (a user id) costs that family its series budget and
+is attributed on
+`metrics_observations_dropped_total{metric="..."}` instead of taking
+the process down. A metric name that isn't a valid Prometheus name, or that
+collides with an existing family under a different type, aborts at
+registration: both produce a scrape Prometheus rejects in full, and nothing
+in-process would notice.
+
+One more hook is worth wiring, because middleware cannot reach it. The
+transport answers over-limit requests (413/431) itself, while the parser is
+still reading and before any handler chain exists — so `RecordMetrics` never
+sees them and an over-limit flood would be invisible in the counters:
+
+```cpp
+options.on_rejected = smithy::server::RecordRejections(metrics);
+```
+
+These count as requests (`route="unmatched"`, with `413`/`431` as the
+signature) but file no latency and never move the in-flight gauge: a request
+refused at parse time has no service latency to report, and recording it as a
+zero observation would drag `rate(_sum)/rate(_count)` down — flattering the
+latency panel during exactly the flood it should be exposing. Because they
+are counted and not timed, a route that only ever saw rejections appears in
+the request counters with no histogram series at all. A method that never
+parsed (a 431 can fire mid-headers) is labeled `(unparsed)` rather than
+`CUSTOM`, since "never parsed" and "client invented a verb" are different
+diagnoses.
+
+The endpoint is unauthenticated: it is middleware, so gate it the way you
+gate anything else — compose `Guard` or `RequireBearerAuth` outside it, or
+bind the scrape listener somewhere the internet cannot reach.
 
 **OpenTelemetry:** not bundled, by design — opentelemetry-cpp's dependency
 tree (protobuf, gRPC for OTLP) would violate the runtime's dep-light rule.

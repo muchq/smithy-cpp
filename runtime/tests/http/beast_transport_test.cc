@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <future>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -19,6 +20,7 @@
 #include <vector>
 
 #include "smithy/http/socket_transport.h"
+#include "smithy/server/metrics.h"
 #include "smithy/server/middleware.h"
 #include "smithy/testing/connection_event_recorder.h"
 
@@ -1261,6 +1263,137 @@ TEST(BeastTransportTest, HeadResponsesCarryTheGetsLengthAndNoBody) {
   const auto get_header_end = get.find("\r\n\r\n");
   ASSERT_NE(get_header_end, std::string::npos) << get;
   EXPECT_EQ(get.substr(get_header_end + 4), R"({"id":"abc"})") << get;
+
+  server.Stop();
+}
+
+TEST(BeastTransportTest, TheMetricsEndpointScrapesOverTheRealTransport) {
+  // The registry and the exposition are unit-tested; what only a real socket
+  // proves is that a scrape survives the transport — the exposition's own
+  // content type reaches the client, and the traffic counted is the traffic
+  // the transport actually served.
+  auto metrics = std::make_shared<smithy::server::MetricsRegistry>(
+      smithy::server::MetricsOptions{.enabled = true, .service_name = "todo-service"});
+  BeastServerTransport server;
+  ASSERT_TRUE(server
+                  .Start(smithy::server::Chain({smithy::server::MetricsEndpoint(metrics),
+                                                smithy::server::RecordMetrics(metrics)},
+                                               [](const HttpRequest&) {
+                                                 HttpResponse response;
+                                                 response.status = 200;
+                                                 response.operation = "GetThing";
+                                                 response.body = "ok";
+                                                 return response;
+                                               }))
+                  .ok());
+
+  ASSERT_FALSE(
+      RawRoundTrip(server.port(), "GET /thing HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n")
+          .empty());
+
+  const std::string scrape =
+      RawRoundTrip(server.port(), "GET /metrics HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n");
+  const auto header_end = scrape.find("\r\n\r\n");
+  ASSERT_NE(header_end, std::string::npos) << scrape;
+  EXPECT_NE(AsciiLowerCopy(scrape.substr(0, header_end))
+                .find("content-type: text/plain; version=0.0.4; charset=utf-8"),
+            std::string::npos)
+      << scrape;
+  const std::string body = scrape.substr(header_end + 4);
+  EXPECT_NE(
+      body.find(
+          R"(http_server_requests_total{service_name="todo-service",http_method="GET",route="GetThing"} 1)"),
+      std::string::npos)
+      << body;
+  // The scrape itself went through MetricsEndpoint, which sits outside
+  // RecordMetrics — so it answered without counting itself.
+  EXPECT_EQ(body.find(R"(operation="",status="200")"), std::string::npos) << body;
+
+  server.Stop();
+}
+
+TEST(BeastTransportTest, AnOverLimitRejectionReachesTheMetricsScrape) {
+  // The gap RecordMetrics cannot close on its own: the transport writes this
+  // 413 before any handler chain exists, so middleware never sees it and an
+  // over-limit flood would be invisible in the request counters. Wiring
+  // on_rejected is what makes it visible, and only a real transport proves
+  // the wiring — the rejection has no in-process caller to fake.
+  auto metrics = std::make_shared<smithy::server::MetricsRegistry>(
+      smithy::server::MetricsOptions{.enabled = true, .service_name = "todo-service"});
+  BeastServerTransport server(BeastServerTransport::Options{
+      .max_body_bytes = 1024, .on_rejected = smithy::server::RecordRejections(metrics)});
+  ASSERT_TRUE(server
+                  .Start(smithy::server::Chain({smithy::server::MetricsEndpoint(metrics),
+                                                smithy::server::RecordMetrics(metrics)},
+                                               [](const HttpRequest&) {
+                                                 HttpResponse response;
+                                                 response.status = 200;
+                                                 response.operation = "GetThing";
+                                                 return response;
+                                               }))
+                  .ok());
+
+  SocketHttpClient client("127.0.0.1", server.port());
+  HttpRequest oversized;
+  oversized.method = "POST";
+  oversized.target = "/upload";
+  oversized.body = std::string(64 * 1024, 'x');
+  const auto rejected = client.Send(oversized);
+  ASSERT_TRUE(rejected.ok()) << rejected.error().message();
+  ASSERT_EQ(rejected->status, 413);
+
+  const std::string scrape =
+      RawRoundTrip(server.port(), "GET /metrics HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n");
+  const auto header_end = scrape.find("\r\n\r\n");
+  ASSERT_NE(header_end, std::string::npos) << scrape;
+  const std::string body = scrape.substr(header_end + 4);
+  EXPECT_NE(
+      body.find(
+          R"(http_server_requests_total{service_name="todo-service",http_method="POST",route="unmatched"} 1)"),
+      std::string::npos)
+      << body;
+  // Counted, but not filed as a latency observation: a request refused at
+  // parse time has no service latency, and zeros here would flatter the
+  // panel during exactly the flood it should expose.
+  EXPECT_EQ(
+      body.find(
+          R"(http_server_request_duration_microseconds_count{service_name="todo-service",http_method="POST",route="unmatched"})"),
+      std::string::npos)
+      << body;
+
+  server.Stop();
+}
+
+TEST(BeastTransportTest, TheMetricsEndpointsHeadReportsTheGetsLength) {
+  // Same framing hazard as the health endpoint below: MetricsEndpoint answers
+  // HEAD itself, so it is on the handler to hand the transport a full body
+  // and let the transport withhold the octets while keeping the length.
+  auto metrics = std::make_shared<smithy::server::MetricsRegistry>(
+      smithy::server::MetricsOptions{.enabled = true, .service_name = "todo-service"});
+  BeastServerTransport server;
+  ASSERT_TRUE(server
+                  .Start(smithy::server::Chain({smithy::server::MetricsEndpoint(metrics)},
+                                               [](const HttpRequest&) {
+                                                 HttpResponse response;
+                                                 response.status = 404;
+                                                 response.body = "no route";
+                                                 return response;
+                                               }))
+                  .ok());
+
+  const std::string head =
+      RawRoundTrip(server.port(), "HEAD /metrics HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n");
+  const std::string get =
+      RawRoundTrip(server.port(), "GET /metrics HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n");
+  const auto head_end = head.find("\r\n\r\n");
+  const auto get_end = get.find("\r\n\r\n");
+  ASSERT_NE(head_end, std::string::npos) << head;
+  ASSERT_NE(get_end, std::string::npos) << get;
+
+  EXPECT_EQ(head.substr(head_end + 4), "") << "HEAD answered with a body: " << head;
+  const std::string expected_length = "content-length: " + std::to_string(get.size() - get_end - 4);
+  EXPECT_NE(AsciiLowerCopy(head.substr(0, head_end)).find(expected_length), std::string::npos)
+      << "HEAD did not report the GET's length: " << head;
 
   server.Stop();
 }

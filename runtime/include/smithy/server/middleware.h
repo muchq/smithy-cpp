@@ -2,6 +2,7 @@
 #define SMITHY_SERVER_MIDDLEWARE_H_
 
 #include <chrono>
+#include <cstddef>
 #include <functional>
 #include <optional>
 #include <string>
@@ -92,6 +93,10 @@ struct ReadinessCheck {
 // A HEAD is answered like the GET, body included: the transport withholds
 // the octets and keeps the length (RFC 9110 §9.3.2), and that length is
 // what the HEAD was asking for.
+//
+// Probe responses carry <path> as their HttpResponse::operation, so a probe
+// composed inside an observability chain reports as itself rather than as
+// the empty operation that 404s and 405s already use.
 Middleware HealthEndpoint(std::string path = "/health", std::vector<ReadinessCheck> checks = {});
 
 // One served request, as seen from outside the router.
@@ -100,7 +105,9 @@ struct RequestObservation {
   std::string target;
   // The Smithy operation that handled the request (from the generated
   // router's HttpResponse::operation annotation); empty for 404/405/400
-  // dispatch failures.
+  // dispatch failures. HealthEndpoint and MetricsEndpoint report their own
+  // path here, so `operation="/health"` can be filtered out of a latency
+  // panel and an empty operation means a dispatch failure and nothing else.
   std::string operation;
   // The request's W3C traceparent header, verbatim, for log correlation.
   // Never empty for requests served through a transport: the ingress mints a
@@ -113,6 +120,28 @@ struct RequestObservation {
   // as zero; duration_cast to coarser units at the metrics boundary if
   // needed.
   std::chrono::microseconds duration{0};
+  // Body sizes in bytes. response_bytes is 0 when the handler threw, since
+  // there is no response — read handler_threw to tell that apart from a
+  // handler that deliberately answered with an empty body.
+  std::size_t request_bytes = 0;
+  std::size_t response_bytes = 0;
+  // The client as derived from the L4 peer and x-forwarded-for (ADR-0012),
+  // with its provenance — NOT the raw header, which a client can forge. This
+  // is the identity PerClientRateLimit keys on, so it is the one that answers
+  // "whose bucket did that 429 come from". Derived against the TrustedProxies
+  // passed to Observe: unset means TrustedProxies::None(), the deliberate
+  // direct-connect statement, under which the peer is the client and the
+  // header is ignored wholly. `source` is worth reporting alongside the
+  // address — the *distribution* of sources across requests is the
+  // misconfiguration signal docs/production-guide.md reads.
+  http::DerivedClient client{};
+  // True when the handler threw and Observe reported the contained 500 on its
+  // behalf. Distinguishes "we crashed" from "the handler deliberately
+  // answered 500", which is the first question asked about a 5xx spike. The
+  // exception text is not here: it stays on the transport's containment log,
+  // which carries the same trace id (ADR-0011). Always false under
+  // -fno-exceptions, where the path is compiled out.
+  bool handler_threw = false;
 };
 
 // What on_start sees, before the router runs. The Smithy operation is not
@@ -134,9 +163,15 @@ struct RequestStart {
 // sink would otherwise fail silently); on_start and now may be null. Callbacks run on the
 // transport's request thread; keep them cheap or hand off. now is injectable for deterministic
 // tests (null means steady_clock).
+// `trusted` is the ADR-0012 trust boundary used to derive
+// RequestObservation::client. Pass the same one given to PerClientRateLimit,
+// or a 429's bucket and the client an observation reports will disagree.
+// Unset means TrustedProxies::None() — the deliberate direct-connect
+// statement, which reports the peer itself.
 Middleware Observe(std::function<void(const RequestObservation&)> on_complete,
                    std::function<void(const RequestStart&)> on_start = nullptr,
-                   std::function<std::chrono::steady_clock::time_point()> now = nullptr);
+                   std::function<std::chrono::steady_clock::time_point()> now = nullptr,
+                   http::TrustedProxies trusted = http::TrustedProxies::None());
 
 // 401 unless the request carries "authorization: Bearer <token>" (scheme
 // matched case-insensitively per RFC 6750) and validator(token) returns

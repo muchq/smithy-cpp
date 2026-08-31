@@ -33,7 +33,7 @@ bazel_dep(name = "rules_testing", version = "0.9.0", dev_dependency = True)
 # boost.context std::result_of gap). Dev-only and unregistered by default:
 # the CI job selects it with --extra_toolchains, so ordinary builds keep the
 # autodetected toolchain. libc++ is toolchains_llvm's default stdlib.
-bazel_dep(name = "toolchains_llvm", version = "1.8.0", dev_dependency = True)
+bazel_dep(name = "toolchains_llvm", version = "1.9.0", dev_dependency = True)
 
 llvm = use_extension("@toolchains_llvm//toolchain/extensions:llvm.bzl", "llvm", dev_dependency = True)
 llvm.toolchain(
